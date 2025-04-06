@@ -45,6 +45,14 @@ function download_ui() {
   cp -a "${tmp_ui_path}/ui/dist/." "${ui_path}"
 
   rm -rf "${tmp_ui_path}"
+
+  # from local
+  rm -rf "${ui_path}"
+  mkdir -p "${ui_path}"
+
+  gpustack::log::info "copying ui assets from ../gpustack-ui/dist"
+
+  cp -r "${ROOT_DIR}/../gpustack-ui/dist/." "${ui_path}/"
 }
 
 # Copy extra static files to ui including catalog icons

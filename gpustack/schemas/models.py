@@ -141,6 +141,9 @@ class ModelSpecBase(SQLModel, ModelSource):
 
     replicas: int = Field(default=1, ge=0)
     ready_replicas: int = Field(default=0, ge=0)
+    auto_load: int = Field(
+        default=1, description="Whether to auto-load instances when requests come in"
+    )
     categories: List[str] = Field(sa_column=Column(JSON), default=[])
     embedding_only: Annotated[
         bool,

@@ -1,6 +1,7 @@
 from typing import List, Optional
 import httpx
 import logging
+import asyncio
 
 from fastapi import APIRouter, Query, Request, Response, status
 from openai.types import Model as OAIModel
@@ -24,15 +25,23 @@ from gpustack.routes.models import build_pg_category_condition
 from gpustack.schemas.models import (
     CategoryEnum,
     Model,
+    ModelInstanceStateEnum,
+    ModelInstance,
 )
 from gpustack.server.db import get_session_context
 from gpustack.server.deps import SessionDep
+
 from gpustack.server.services import ModelInstanceService, ModelService, WorkerService
+from gpustack.server.db import get_engine
 
 
 logger = logging.getLogger(__name__)
 
 load_balancer = LoadBalancer()
+
+# Add shared locks and tasks for concurrent instance requests
+model_startup_locks = {}  # model_id -> asyncio.Lock()
+model_startup_tasks = {}  # model_id -> asyncio.Task
 
 
 aliasable_router = APIRouter()
@@ -166,7 +175,7 @@ async def list_models(
     return result
 
 
-async def proxy_request_by_model(request: Request, endpoint: str):
+async def proxy_request_by_model(request: Request, endpoint: str):  # noqa: C901
     """
     Proxy the request to the model instance that is running the model specified in the
     request body.
@@ -185,13 +194,23 @@ async def proxy_request_by_model(request: Request, endpoint: str):
         request.state.model = model
         request.state.stream = stream
 
-        instance = await get_running_instance(session, model.id)
-        worker = await WorkerService(session).get_by_id(instance.worker_id)
-        if not worker:
-            raise InternalServerErrorException(
-                message=f"Worker with ID {instance.worker_id} not found",
-                is_openai_exception=True,
+    # Get an instance - this may wait for an instance to become available
+    try:
+        # start a new session for this request
+        async with AsyncSession(get_engine()) as new_session:
+            instance, instance_just_started = await get_running_instance(
+                new_session, model.id
             )
+    except Exception as e:
+        logger.error(f"Failed to get running instance: {e}")
+        raise
+
+    worker = await WorkerService(session).get_by_id(instance.worker_id)
+    if not worker:
+        raise InternalServerErrorException(
+            message=f"Worker with ID {instance.worker_id} not found",
+            is_openai_exception=True,
+        )
 
     url = f"http://{instance.worker_ip}:{worker.port}/proxy/v1/{endpoint}"
     token = request.app.state.server_config.token
@@ -370,7 +389,6 @@ async def handle_standard_request(
     headers = filter_headers(request.headers)
     if extra_headers:
         headers.update(extra_headers)
-
     async with httpx.AsyncClient() as client:
         resp = await client.request(
             method=request.method,
@@ -400,13 +418,241 @@ def filter_headers(headers):
     }
 
 
-async def get_running_instance(session: AsyncSession, model_id: int):
+async def get_running_instance(session: AsyncSession, model_id: int):  # noqa: C901
+    """
+    Get a running instance for the model, or start one if none are running.
+    Returns the instance and a boolean indicating if it was just started.
+
+    Handles concurrent requests with a lock and shared task mechanism to prevent
+    creating multiple instances when multiple requests arrive simultaneously.
+    """
+    # First check for already running instances
     running_instances = await ModelInstanceService(session).get_running_instances(
         model_id
     )
-    if not running_instances:
-        raise ServiceUnavailableException(
-            message="No running instances available",
+
+    if running_instances:
+        # Normal case - instance already running
+        return await load_balancer.get_instance(running_instances), False
+
+    # No running instances - need to either wait for an existing startup task
+    # or create a new one, using a lock to synchronize between concurrent requests
+
+    # Initialize lock for this model if needed
+    if model_id not in model_startup_locks:
+        model_startup_locks[model_id] = asyncio.Lock()
+
+    # Check if there's an ongoing startup task we can wait for
+    if model_id in model_startup_tasks and not model_startup_tasks[model_id].done():
+        logger.info(f"Waiting for existing startup task for model ID {model_id}")
+        try:
+            return await model_startup_tasks[model_id]
+        except Exception as e:
+            # If the task failed, we'll start a new one below
+            logger.error(f"Existing startup task for model ID {model_id} failed: {e}")
+
+    # Acquire the lock to ensure only one request initializes a new startup task
+    async with model_startup_locks[model_id]:
+        # Double-check for running instances after acquiring the lock
+        fresh_running = await ModelInstanceService(session).get_running_instances(
+            model_id
+        )
+        if fresh_running:
+            return await load_balancer.get_instance(fresh_running), False
+
+        # Check again for an ongoing startup task (might have been created while waiting for lock)
+        if model_id in model_startup_tasks and not model_startup_tasks[model_id].done():
+            # Release lock and wait for the task
+            pass  # Lock is released when exiting this block
+        else:
+            # Create a new startup task
+            logger.info(f"Creating new startup task for model ID {model_id}")
+            model_startup_tasks[model_id] = asyncio.create_task(
+                _start_model_instance(session, model_id)
+            )
+
+    # Wait for the task result outside the lock
+    try:
+        return await model_startup_tasks[model_id]
+    except Exception as e:
+        # Clean up the task on failure so future requests can try again
+        if model_id in model_startup_tasks:
+            del model_startup_tasks[model_id]
+        logger.error(f"Failed to start instance for model ID {model_id}: {e}")
+        raise
+
+
+async def _start_model_instance(session: AsyncSession, model_id: int):  # noqa: C901
+    """
+    Internal method to start a model instance.
+    This runs as a task and is shared by concurrent requests.
+    """
+    # Get model info
+    model = await Model.one_by_id(session, model_id)
+    if not model:
+        raise NotFoundException(
+            message="Model not found",
             is_openai_exception=True,
         )
-    return await load_balancer.get_instance(running_instances)
+
+    # Get all instances for this model
+    model_instances = await ModelInstance.all_by_field(
+        session=session, field="model_id", value=model_id
+    )
+
+    # Check for instances in non-ERROR states (might be starting up)
+    starting_instances = [
+        inst
+        for inst in model_instances
+        if inst.state != ModelInstanceStateEnum.ERROR
+        and inst.state != ModelInstanceStateEnum.RUNNING
+    ]
+
+    # If no starting instances, check error instances and potentially create a new one
+    if not starting_instances:
+        error_instances = [
+            inst
+            for inst in model_instances
+            if inst.state == ModelInstanceStateEnum.ERROR
+        ]
+
+        if error_instances and not model.restart_on_error:
+            error_messages = [
+                f"{inst.name}: {inst.state_message}" for inst in error_instances
+            ]
+            raise ServiceUnavailableException(
+                message=f"All instances for model {model.name} are in error state: {'; '.join(error_messages)}",
+                is_openai_exception=True,
+            )
+        # Check if auto_load is enabled
+        if not model.auto_load:
+            raise ServiceUnavailableException(
+                message=f"Auto-load is disabled for model {model.name}. Please start the model manually.",
+                is_openai_exception=True,
+            )
+
+        # Create a new instance by increasing replicas
+        logger.info(
+            f"No running instances for model {model.name}, increasing replicas to start one"
+        )
+        current_replicas = model.replicas
+        model.replicas = max(1, current_replicas)
+        await model.update(session)
+
+        # Wait for ModelController to create the instance
+        logger.info(
+            f"Waiting for ModelController to create an instance for model {model.name}"
+        )
+        creation_timeout = 60  # seconds to wait for creation
+        creation_interval = 1  # seconds between checks
+        creation_time = 0
+
+        while creation_time < creation_timeout:
+            await asyncio.sleep(creation_interval)
+            creation_time += creation_interval
+
+            # Check for new instances
+            fresh_instances = await ModelInstance.all_by_field(
+                session=session, field="model_id", value=model_id
+            )
+
+            if len(fresh_instances) > len(model_instances):
+                starting_instances = [
+                    inst
+                    for inst in fresh_instances
+                    if inst.state != ModelInstanceStateEnum.ERROR
+                    and inst.state != ModelInstanceStateEnum.RUNNING
+                ]
+
+                if starting_instances:
+                    logger.info(
+                        f"Found new instance {starting_instances[0].name} after {creation_time}s"
+                    )
+                    break
+
+            if creation_time % 10 == 0:
+                logger.info(f"Still waiting for instance creation ({creation_time}s)")
+
+        if not starting_instances:
+            raise ServiceUnavailableException(
+                message=f"Timeout waiting for instance creation for model {model.name}",
+                is_openai_exception=True,
+            )
+
+    # Set initial message
+    instance = starting_instances[0]
+    instance_id = instance.id
+    instance.state_message = "Instance is starting on demand. Please wait..."
+    await instance.update(session)
+
+    # Wait for the instance to become RUNNING with unified timeout
+    logger.info(
+        f"Waiting for instance {instance.name} to become available, current state: {instance.state}"
+    )
+
+    max_wait_time = 300  # 5 minutes total wait time
+    check_interval = 2  # Check every 2 seconds
+    wait_time = 0
+
+    # Main wait loop
+    while wait_time < max_wait_time:
+        # Check current state - get fresh instance each time to avoid stale state
+        instance = await ModelInstance.one_by_id(session, instance_id)
+
+        # Return immediately if running
+        if instance.state == ModelInstanceStateEnum.RUNNING:
+            logger.info(f"Instance {instance.name} is now running after {wait_time}s")
+            return instance, True
+
+        # Error state check
+        if instance.state == ModelInstanceStateEnum.ERROR:
+            raise ServiceUnavailableException(
+                message=f"Instance failed to start: {instance.state_message}",
+                is_openai_exception=True,
+            )
+
+        # Update progress message periodically
+        if wait_time % 30 == 0:
+            progress_msg = f"Instance is starting on demand. Waited {wait_time}s..."
+
+            if (
+                instance.state == ModelInstanceStateEnum.DOWNLOADING
+                and instance.download_progress
+            ):
+                max_wait_time += (
+                    300  # if downloading, extend max_wait_time by 5 minutes
+                )
+                progress_msg += f" Downloading: {instance.download_progress:.1f}%"
+
+            if instance.state_message != progress_msg:
+                instance.state_message = progress_msg
+                await instance.update(session)
+
+            logger.info(
+                f"Still waiting for instance {instance.name}, state: {instance.state}"
+            )
+
+        # Check for other instances that might have become RUNNING
+        if wait_time % 20 == 0 and wait_time > 0:  # Every 20s after first check
+            running_instances = [
+                inst
+                for inst in await ModelInstance.all_by_field(
+                    session=session, field="model_id", value=model_id
+                )
+                if inst.state == ModelInstanceStateEnum.RUNNING
+            ]
+
+            if running_instances:
+                logger.info(f"Found another running instance for model {model.name}")
+                return await load_balancer.get_instance(running_instances), True
+
+        # Wait before next check
+        await asyncio.sleep(check_interval)
+        wait_time += check_interval
+        session.expunge_all()
+
+    # Timeout reached
+    raise GatewayTimeoutException(
+        message=f"Timeout waiting for model {model.name} instance to become available",
+        is_openai_exception=True,
+    )
