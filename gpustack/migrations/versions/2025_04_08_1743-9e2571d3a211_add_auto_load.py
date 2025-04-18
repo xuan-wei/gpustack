@@ -20,9 +20,11 @@ def upgrade() -> None:
     # Add auto_load column to models table with default value 1 (enabled)
     with op.batch_alter_table('models', schema=None) as batch_op:
         batch_op.add_column(sa.Column('auto_load', sa.Integer(), server_default='1', nullable=False))
+        batch_op.add_column(sa.Column('auto_load_replicas', sa.Integer(), server_default='1', nullable=False))
 
 
 def downgrade() -> None:
     # Remove auto_load column from models table
     with op.batch_alter_table('models', schema=None) as batch_op:
         batch_op.drop_column('auto_load') 
+        batch_op.drop_column('auto_load_replicas')

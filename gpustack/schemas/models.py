@@ -144,6 +144,19 @@ class ModelSpecBase(SQLModel, ModelSource):
     auto_load: int = Field(
         default=1, description="Whether to auto-load instances when requests come in"
     )
+    auto_load_replicas: int = Field(
+        default=1, description="Number of replicas to auto-load when requests come in"
+    )
+    auto_unload: int = Field(
+        default=0, description="Whether to auto-offload instances after timeout"
+    )
+    auto_unload_timeout: int = Field(
+        default=120,
+        description="Seconds of inactivity before auto-offloading a model instance",
+    )
+    last_request_time: Optional[datetime] = Field(
+        sa_column=Column(UTCDateTime), default=None
+    )
     categories: List[str] = Field(sa_column=Column(JSON), default=[])
     embedding_only: Annotated[
         bool,

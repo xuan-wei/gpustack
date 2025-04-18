@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import functools
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Union
 from aiocache import Cache, BaseCache
 from sqlmodel import SQLModel, bindparam, cast, col
@@ -215,6 +216,18 @@ class ModelService:
         await delete_cache_by_key(self.get_by_name, model.name)
         return result
 
+    async def update_last_request_time(self, model_id: int) -> None:
+        """Update the last request time for a model.
+
+        Args:
+            model_id: ID of the model.
+        """
+        model = await Model.one_by_id(self.session, model_id)
+        if model:
+            model.last_request_time = datetime.now(timezone.utc)
+            await model.update(self.session)
+            logger.debug(f"Updated last_request_time for model {model.name}")
+
 
 class ModelInstanceService:
     def __init__(self, session: AsyncSession):
@@ -222,6 +235,20 @@ class ModelInstanceService:
 
     @locked_cached(ttl=60)
     async def get_running_instances(self, model_id: int) -> List[ModelInstance]:
+        results = await ModelInstance.all_by_fields(
+            self.session,
+            fields={"model_id": model_id, "state": ModelInstanceStateEnum.RUNNING},
+        )
+        if results is None:
+            return []
+
+        for result in results:
+            self.session.expunge(result)
+        return results
+
+    async def get_running_instances_no_cache(
+        self, model_id: int
+    ) -> List[ModelInstance]:
         results = await ModelInstance.all_by_fields(
             self.session,
             fields={"model_id": model_id, "state": ModelInstanceStateEnum.RUNNING},

@@ -32,8 +32,6 @@ from gpustack.server.db import get_session_context
 from gpustack.server.deps import SessionDep
 
 from gpustack.server.services import ModelInstanceService, ModelService, WorkerService
-from gpustack.server.db import get_engine
-
 
 logger = logging.getLogger(__name__)
 
@@ -194,23 +192,26 @@ async def proxy_request_by_model(request: Request, endpoint: str):  # noqa: C901
         request.state.model = model
         request.state.stream = stream
 
-    # Get an instance - this may wait for an instance to become available
-    try:
-        # start a new session for this request
-        async with AsyncSession(get_engine()) as new_session:
-            instance, instance_just_started = await get_running_instance(
-                new_session, model.id
-            )
-    except Exception as e:
-        logger.error(f"Failed to get running instance: {e}")
-        raise
+        # Update the last_request_time for auto-unload feature
+        model_service = ModelService(session)
+        await model_service.update_last_request_time(model.id)
 
-    worker = await WorkerService(session).get_by_id(instance.worker_id)
-    if not worker:
-        raise InternalServerErrorException(
-            message=f"Worker with ID {instance.worker_id} not found",
-            is_openai_exception=True,
-        )
+        # Get an instance - this may wait for an instance to become available
+
+        try:
+            instance, instance_just_started = await get_running_instance(
+                session, model.id
+            )
+        except Exception as e:
+            logger.error(f"Failed to get running instance: {e}")
+            raise
+
+        worker = await WorkerService(session).get_by_id(instance.worker_id)
+        if not worker:
+            raise InternalServerErrorException(
+                message=f"Worker with ID {instance.worker_id} not found",
+                is_openai_exception=True,
+            )
 
     url = f"http://{instance.worker_ip}:{worker.port}/proxy/v1/{endpoint}"
     token = request.app.state.server_config.token
@@ -426,10 +427,25 @@ async def get_running_instance(session: AsyncSession, model_id: int):  # noqa: C
     Handles concurrent requests with a lock and shared task mechanism to prevent
     creating multiple instances when multiple requests arrive simultaneously.
     """
+
     # First check for already running instances
-    running_instances = await ModelInstanceService(session).get_running_instances(
-        model_id
-    )
+    running_instances = await ModelInstanceService(
+        session
+    ).get_running_instances_no_cache(model_id)
+
+    model = await Model.one_by_id(session, model_id)
+    if len(running_instances) != model.auto_load_replicas:
+        error_instances = await ModelInstance.all_by_field(
+            session=session, field="model_id", value=model_id
+        )
+        error_instances = [
+            inst
+            for inst in error_instances
+            if inst.state == ModelInstanceStateEnum.ERROR
+        ]
+
+        model.replicas = model.auto_load_replicas + len(error_instances)
+        await model.update(session)
 
     if running_instances:
         # Normal case - instance already running
@@ -454,9 +470,9 @@ async def get_running_instance(session: AsyncSession, model_id: int):  # noqa: C
     # Acquire the lock to ensure only one request initializes a new startup task
     async with model_startup_locks[model_id]:
         # Double-check for running instances after acquiring the lock
-        fresh_running = await ModelInstanceService(session).get_running_instances(
-            model_id
-        )
+        fresh_running = await ModelInstanceService(
+            session
+        ).get_running_instances_no_cache(model_id)
         if fresh_running:
             return await load_balancer.get_instance(fresh_running), False
 
@@ -535,8 +551,7 @@ async def _start_model_instance(session: AsyncSession, model_id: int):  # noqa: 
         logger.info(
             f"No running instances for model {model.name}, increasing replicas to start one"
         )
-        current_replicas = model.replicas
-        model.replicas = max(1, current_replicas)
+        model.replicas = model.auto_load_replicas + len(error_instances)
         await model.update(session)
 
         # Wait for ModelController to create the instance
