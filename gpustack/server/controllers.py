@@ -195,15 +195,14 @@ async def ensure_instance_model_file(session: AsyncSession, instance: ModelInsta
     model_files = await get_or_create_model_files_for_instance(session, instance)
     for model_file in model_files:
         if model_file.state == ModelFileStateEnum.ERROR:
+            logger.info(
+                f"Retrying download for model file {model_file.readable_source} for model instance {instance.name}"
+            )
             # Retry the download
             model_file.state = ModelFileStateEnum.DOWNLOADING
             model_file.download_progress = 0
             model_file.state_message = ""
             await model_file.update(session)
-
-        logger.info(
-            f"Retrying download for model file {model_file.readable_source} for model instance {instance.name}"
-        )
 
     instance = await ModelInstance.one_by_id(session, instance.id)
     instance.model_files = model_files
