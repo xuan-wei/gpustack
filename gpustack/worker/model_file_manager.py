@@ -202,6 +202,7 @@ class ModelFileDownloadTask:
             cache_dir=self._config.cache_dir,
             ollama_library_base_url=self._config.ollama_library_base_url,
             huggingface_token=self._config.huggingface_token,
+            ollama_path=self._config.ollama_path,
         )
         self._update_model_file(
             self._model_file.id,

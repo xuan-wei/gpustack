@@ -38,6 +38,7 @@ def download_model(
     cache_dir: Optional[str] = None,
     ollama_library_base_url: Optional[str] = None,
     huggingface_token: Optional[str] = None,
+    ollama_path: Optional[str] = None,
 ) -> List[str]:
     if model.source == SourceEnum.HUGGING_FACE:
         return HfDownloader.download(
@@ -50,7 +51,8 @@ def download_model(
         )
     elif model.source == SourceEnum.OLLAMA_LIBRARY:
         ollama_downloader = OllamaLibraryDownloader(
-            registry_url=ollama_library_base_url
+            registry_url=ollama_library_base_url,
+            ollama_path=ollama_path,
         )
         return ollama_downloader.download(
             model_name=model.ollama_library_model_name,
@@ -273,8 +275,10 @@ class OllamaLibraryDownloader:
     def __init__(
         self,
         registry_url: Optional[str] = "https://registry.ollama.ai",
+        ollama_path: Optional[str] = None,
     ):
         self._registry_url = registry_url
+        self._ollama_path = ollama_path
 
     def download_blob(
         self, url: str, registry_token: str, filename: str, _nb_retries: int = 5
@@ -332,12 +336,14 @@ class OllamaLibraryDownloader:
                 )
         os.rename(temp_filename, filename)
 
-    def download(
+    def download(  # noqa: C901
         self,
         model_name: str,
         local_dir: Optional[str] = None,
         cache_dir: Optional[str] = None,
     ) -> List[str]:
+        import json
+
         sanitized_filename = re.sub(r"[^a-zA-Z0-9]", "_", model_name)
 
         if cache_dir is None:
@@ -349,6 +355,112 @@ class OllamaLibraryDownloader:
         if local_dir and not os.path.exists(local_dir):
             os.makedirs(local_dir)
 
+        # If ollama_path is provided, use it for download and symlink
+        if self._ollama_path:
+            logger.info(f"Using ollama path: {self._ollama_path}")
+            try:
+                # Prepare system ollama directories
+                blobs_dir = os.path.join(self._ollama_path, "blobs")
+                manifests_dir = os.path.join(
+                    self._ollama_path, "manifests", "registry.ollama.ai"
+                )
+                os.makedirs(blobs_dir, exist_ok=True)
+                os.makedirs(manifests_dir, exist_ok=True)
+
+                # Download manifest and all blobs
+                repo, tag = self.parse_model_name(model_name)
+                manifest_url = f"{self._registry_url}/v2/{repo}/manifests/{tag}"
+                blob_url, registry_token = self.model_url(
+                    model_name=model_name, cache_dir=cache_dir
+                )
+                headers = {
+                    _header_user_agent: self._user_agent,
+                    _header_accept: "application/vnd.docker.distribution.manifest.v2+json",
+                }
+                if registry_token:
+                    headers[_header_authorization] = registry_token
+                response = requests.get(manifest_url, headers=headers)
+                if response.status_code != 200:
+                    raise Exception(f"Failed to download manifest for {model_name}")
+                manifest = response.json()
+
+                # Save manifest to system ollama_path
+                manifest_path = os.path.join(manifests_dir, repo, tag)
+                os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
+                with open(manifest_path, "w") as f:
+                    json.dump(manifest, f)
+
+                # Download all blobs in layers
+                model_blob_path = None
+                for layer in manifest.get("layers", []):
+                    digest = layer["digest"]
+                    blob_filename = digest.replace(":", "-")
+                    blob_path = os.path.join(blobs_dir, blob_filename)
+                    layer_blob_url = f"{self._registry_url}/v2/{repo}/blobs/{digest}"
+                    try:
+                        if not os.path.exists(blob_path):
+                            self.download_blob(
+                                layer_blob_url, registry_token, blob_path
+                            )
+                    except PermissionError as e:
+                        logger.error(
+                            f"Permission denied when writing blob: {blob_path}: {e}\n"
+                            f"Current user: {os.getlogin()} does not have write permission.\n"
+                            f"Please run gpustack as the same user as system ollama, or fix directory permissions."
+                        )
+                        raise
+                    if layer["mediaType"] == "application/vnd.ollama.image.model":
+                        model_blob_path = blob_path
+
+                # Download config blob if present
+                config = manifest.get("config")
+                if config and "digest" in config:
+                    config_digest = config["digest"]
+                    config_blob_filename = config_digest.replace(":", "-")
+                    config_blob_path = os.path.join(blobs_dir, config_blob_filename)
+                    config_blob_url = (
+                        f"{self._registry_url}/v2/{repo}/blobs/{config_digest}"
+                    )
+                    try:
+                        if not os.path.exists(config_blob_path):
+                            self.download_blob(
+                                config_blob_url, registry_token, config_blob_path
+                            )
+                    except PermissionError as e:
+                        logger.error(
+                            f"Permission denied when writing config blob: {config_blob_path}: {e}\n"
+                            f"Current user: {os.getlogin()} does not have write permission.\n"
+                            f"Please run gpustack as the same user as system ollama, or fix directory permissions."
+                        )
+                        raise
+
+                # Create symlink in cache_dir for model layer only
+                if model_blob_path:
+                    link_name = sanitized_filename
+                    link_path = os.path.join(cache_dir, link_name)
+                    try:
+                        if not os.path.exists(link_path):
+                            os.symlink(model_blob_path, link_path)
+                    except PermissionError as e:
+                        logger.error(
+                            f"Permission denied when creating symlink: {link_path}: {e}\n"
+                            f"Current user: {os.getlogin()} does not have write permission to {os.path.dirname(link_path)}.\n"
+                            f"Please run gpustack as the same user as system ollama, or fix directory permissions."
+                        )
+                        raise
+                    logger.info(f"Created symlink: {link_path}")
+                    return [link_path]
+                else:
+                    raise Exception("No model layer found in manifest for symlink.")
+            except PermissionError as e:
+                logger.error(
+                    f"Permission denied during ollama_path operations: {e}\n"
+                    f"Current user: {os.getlogin()} does not have write permission to {self._ollama_path}.\n"
+                    f"Please run gpustack as the same user as system ollama, or fix directory permissions."
+                )
+                raise
+
+        # Fallback to original logic if no ollama_path
         model_dir = local_dir
         if local_dir is None:
             model_dir = cache_dir

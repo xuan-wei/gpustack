@@ -325,6 +325,12 @@ def setup_start_cmd(subparsers: argparse._SubParsersAction):
         action='append',
         help="A list of HTTP request headers that should be supported for cross-origin requests.",
     )
+    group.add_argument(
+        "--ollama-path",
+        type=str,
+        help="Path to the system ollama cache directory. If set, downloaded ollama models will be stored here for reuse.",
+        default=get_gpustack_env("OLLAMA_PATH"),
+    )
 
     parser_server.set_defaults(func=run)
 
@@ -418,6 +424,7 @@ def set_common_options(args, config_data: dict):
         "huggingface_token",
         "enable_ray",
         "ray_args",
+        "ollama_path",
     ]
 
     for option in options:

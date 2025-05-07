@@ -76,6 +76,7 @@ class Config(BaseSettings):
         allow_credentials: Indicate that cookies should be supported for cross-origin requests.
         allow_methods: A list of HTTP methods that should be allowed for cross-origin requests.
         allow_headers: A list of HTTP request headers that should be supported for cross-origin requests.
+        ollama_path: Optional[str] = None
     """
 
     # Common options
@@ -130,6 +131,7 @@ class Config(BaseSettings):
     tools_download_base_url: Optional[str] = None
     rpc_server_args: Optional[List[str]] = None
     enable_hf_transfer: bool = False
+    ollama_path: Optional[str] = None
 
     def __init__(self, **values):
         super().__init__(**values)
