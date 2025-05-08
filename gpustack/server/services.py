@@ -16,6 +16,7 @@ from gpustack.schemas.models import Model, ModelInstance, ModelInstanceStateEnum
 from gpustack.schemas.users import User
 from gpustack.schemas.workers import Worker
 from gpustack.server.usage_buffer import usage_flush_buffer
+from gpustack.server.db import retry_on_db_lock
 
 logger = logging.getLogger(__name__)
 cache = Cache(Cache.MEMORY)
@@ -222,11 +223,19 @@ class ModelService:
         Args:
             model_id: ID of the model.
         """
-        model = await Model.one_by_id(self.session, model_id)
-        if model:
-            model.last_request_time = datetime.now(timezone.utc)
-            await model.update(self.session)
-            logger.debug(f"Updated last_request_time for model {model.name}")
+
+        async def _update():
+            model = await Model.one_by_id(self.session, model_id)
+            if model:
+                model.last_request_time = datetime.now(timezone.utc)
+                await model.update(self.session)
+                logger.debug(f"Updated last_request_time for model {model.name}")
+
+        try:
+            # Use retry mechanism for database lock errors
+            await retry_on_db_lock(_update)
+        except Exception as e:
+            logger.warning(f"Failed to update last_request_time after retries: {e}")
 
 
 class ModelInstanceService:

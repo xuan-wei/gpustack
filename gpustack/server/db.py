@@ -8,7 +8,9 @@ from sqlalchemy.ext.asyncio import (
 from sqlmodel import SQLModel
 from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlalchemy import DDL, event
-
+from sqlalchemy.exc import OperationalError, DBAPIError
+import random
+import asyncio
 from gpustack.schemas.api_keys import ApiKey
 from gpustack.schemas.model_usage import ModelUsage
 from gpustack.schemas.models import Model, ModelInstance
@@ -25,8 +27,8 @@ from gpustack.schemas.stmt import (
 _engine = None
 
 DB_ECHO = os.getenv("GPUSTACK_DB_ECHO", "false").lower() == "true"
-DB_POOL_SIZE = int(os.getenv("GPUSTACK_DB_POOL_SIZE", 5))
-DB_MAX_OVERFLOW = int(os.getenv("GPUSTACK_DB_MAX_OVERFLOW", 10))
+DB_POOL_SIZE = int(os.getenv("GPUSTACK_DB_POOL_SIZE", 50))
+DB_MAX_OVERFLOW = int(os.getenv("GPUSTACK_DB_MAX_OVERFLOW", 500))
 DB_POOL_TIMEOUT = int(os.getenv("GPUSTACK_DB_POOL_TIMEOUT", 30))
 
 
@@ -60,13 +62,11 @@ async def init_db(db_url: str):
 
         _engine = create_async_engine(
             db_url,
-            echo=False,
+            echo=DB_ECHO,
+            pool_size=DB_POOL_SIZE,
+            max_overflow=DB_MAX_OVERFLOW,
+            pool_timeout=DB_POOL_TIMEOUT,
             connect_args=connect_args,
-            pool_size=50,  # Increased from default 5
-            max_overflow=50,  # Increased from default 10
-            pool_timeout=60,  # Increased from default 30
-            pool_recycle=1800,  # Recycle connections every 30 minutes
-            pool_pre_ping=True,  # Enable connection health checks
         )
         listen_events(_engine)
     await create_db_and_tables(_engine)
@@ -105,3 +105,31 @@ def listen_events(engine: AsyncEngine):
 def enable_sqlite_foreign_keys(conn, record):
     # Enable foreign keys for SQLite, since it's disabled by default
     conn.execute("PRAGMA foreign_keys=ON")
+
+
+async def retry_on_db_lock(func, max_retries=5, initial_delay=0.1):
+    """
+    Retry a database operation when SQLite database is locked.
+    Uses exponential backoff.
+    """
+    retries = 0
+    delay = initial_delay
+
+    while True:
+        try:
+            return await func()
+        except (OperationalError, DBAPIError) as e:
+            error_text = str(e).lower()
+            if "database is locked" in error_text or "deadlock detected" in error_text:
+                retries += 1
+                if retries > max_retries:
+                    raise
+
+                # Exponential backoff with jitter
+                jitter = random.uniform(0.8, 1.2)
+                sleep_time = delay * jitter
+                await asyncio.sleep(sleep_time)
+                delay *= 2  # Exponential backoff
+            else:
+                # Not a locking error, re-raise
+                raise
