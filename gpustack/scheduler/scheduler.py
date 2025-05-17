@@ -190,6 +190,7 @@ class Scheduler:
             not model.distributable
             and model.gpu_selector
             and model.gpu_selector.gpu_ids
+            and model.distributed_inference_across_workers
         ):
             worker_gpu_ids = parse_gpu_ids_by_worker(model.gpu_selector.gpu_ids)
             if len(worker_gpu_ids) > 1:
@@ -425,16 +426,6 @@ async def evaluate_gguf_model(
     if task_output.resource_claim_estimate.distributable and not model.distributable:
         should_update = True
         model.distributable = True
-
-    if model.gpu_selector and model.gpu_selector.gpu_ids:
-        worker_gpu_ids = parse_gpu_ids_by_worker(model.gpu_selector.gpu_ids)
-        if (
-            len(worker_gpu_ids) > 1
-            and model.distributable
-            and not model.distributed_inference_across_workers
-        ):
-            should_update = True
-            model.distributed_inference_across_workers = True
 
     return should_update
 
