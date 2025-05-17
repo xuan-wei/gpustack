@@ -371,6 +371,15 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
         await self._set_workers_allocatable_resource(workers)
         self._set_model_parameters()
 
+        # Some workers may be offline, so we need to remove them from the selected_gpu_ids_by_worker.
+        workers_to_remove = []
+        for worker_name in self._selected_gpu_ids_by_worker:
+            if worker_name not in self._worker_name_to_worker:
+                workers_to_remove.append(worker_name)
+
+        for worker_name in workers_to_remove:
+            self._selected_gpu_ids_by_worker.pop(worker_name)
+
         sorted_workers = self._sort_workers_by_allocatable_vram(workers)
         candidates = await self._filter_in_sequence(sorted_workers)
         return candidates
@@ -537,6 +546,7 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
             if (
                 worker_num > 1
                 and candidate_func != self.find_multi_worker_multi_gpu_candidates
+                and self._model.distributed_inference_across_workers
             ):
                 return True
 
@@ -554,6 +564,7 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
                         selected_gpu_count > 1
                         and candidate_func
                         == self.find_single_worker_single_gpu_full_offloading_candidates
+                        and self._model.distributed_inference_across_workers
                     )
                     or (
                         selected_gpu_count == 1

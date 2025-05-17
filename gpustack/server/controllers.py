@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import random
 import string
@@ -223,10 +224,23 @@ async def sync_replicas(session: AsyncSession, model: Model, cfg: Config):
 
         scale_down_count = len(candidates) - model.replicas
         if scale_down_count > 0:
+            # Delete instances with proper error handling and small delays
+            deleted_count = 0
             for candidate in candidates[:scale_down_count]:
                 instance = candidate.model_instance
-                await ModelInstanceService(session).delete(instance)
-                logger.debug(f"Deleted model instance {instance.name}")
+                try:
+                    await ModelInstanceService(session).delete(instance)
+                    deleted_count += 1
+                    logger.debug(f"Deleted model instance {instance.name}")
+                    # Small delay to prevent database connection issues
+                    if deleted_count < scale_down_count:
+                        await asyncio.sleep(0.5)
+                except Exception as e:
+                    logger.error(
+                        f"Failed to delete model instance {instance.name}: {e}"
+                    )
+                    # Continue with remaining deletions instead of failing completely
+                    continue
 
 
 async def ensure_instance_model_file(session: AsyncSession, instance: ModelInstance):
@@ -245,15 +259,14 @@ async def ensure_instance_model_file(session: AsyncSession, instance: ModelInsta
     model_files = await get_or_create_model_files_for_instance(session, instance)
     for model_file in model_files:
         if model_file.state == ModelFileStateEnum.ERROR:
+            logger.info(
+                f"Retrying download for model file {model_file.readable_source} for model instance {instance.name}"
+            )
             # Retry the download
             model_file.state = ModelFileStateEnum.DOWNLOADING
             model_file.download_progress = 0
             model_file.state_message = ""
             await model_file.update(session)
-
-        logger.info(
-            f"Retrying download for model file {model_file.readable_source} for model instance {instance.name}"
-        )
 
     instance = await ModelInstance.one_by_id(session, instance.id)
     instance.model_files = model_files

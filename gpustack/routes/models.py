@@ -250,8 +250,11 @@ async def validate_gpu_ids(  # noqa: C901
 
     if model_backend == BackendEnum.VLLM:
         cfg = get_global_config()
-        if len(worker_name_set) > 1 and not cfg.enable_ray:
-            # REVIEW BEFORE RELEASE: Check if the documentation link needs to be updated.
+        if (
+            len(worker_name_set) > 1
+            and model_in.distributed_inference_across_workers
+            and not cfg.enable_ray
+        ):
             raise BadRequestException(
                 message="Selected GPUs are on different workers, but Ray is not enabled. "
                 "Please enable Ray to make vLLM work across multiple workers. "
