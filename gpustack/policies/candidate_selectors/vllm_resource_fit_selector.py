@@ -226,7 +226,8 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
     def _set_num_attention_heads(self):
         self._num_attention_heads = get_model_num_attention_heads(self._model)
         if (
-            self._gpu_count
+            self._model.distributed_inference_across_workers
+            and self._gpu_count
             and self._num_attention_heads
             and self._num_attention_heads % self._gpu_count != 0
         ):
@@ -346,17 +347,27 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
         """
         Find single worker single gpu full offloading candidates for the model instance with workers.
         """
-        if self._gpu_count is not None and self._gpu_count > 1:
+        if (
+            self._model.distributed_inference_across_workers
+            and self._gpu_count is not None
+            and self._gpu_count > 1
+        ):
             # Skip multi-GPU selection
             return []
 
-        if self._selected_gpu_worker_count > 1:
+        if (
+            self._model.distributed_inference_across_workers
+            and self._selected_gpu_worker_count > 1
+        ):
             # Skip multi-worker selection
             return []
 
         selected_gpu_worker = None
         selected_gpu_index = None
-        if self._selected_gpu_workers:
+        if (
+            self._model.distributed_inference_across_workers
+            and self._selected_gpu_workers
+        ):
             # Handle manual scheduling
             selected_gpu_worker = self._selected_gpu_workers[0]
             selected_gpu_indexes = self._selected_gpu_indexes_by_worker[

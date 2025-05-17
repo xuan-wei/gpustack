@@ -516,6 +516,7 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
             if (
                 worker_num > 1
                 and candidate_func != self.find_multi_worker_multi_gpu_candidates
+                and self._model.distributed_inference_across_workers
             ):
                 return True
 
