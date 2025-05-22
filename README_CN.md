@@ -27,15 +27,33 @@
 <br>
 
 ![demo](https://raw.githubusercontent.com/gpustack/gpustack/main/docs/assets/gpustack-demo.gif)
-
 GPUStack 是一个用于运行 AI 模型的开源 GPU 集群管理器。
+
+### 相较于官方 GPUStack 的变更
+这是一个从官方 [GPUStack](https://github.com/gpustack/gpustack) 的分支。
+
+主要变更：
+1. 实例管理改进
+   - 实现了请求到达时自动启动实例
+   - 添加了自动卸载功能
+   - 增加了分布式推理配置的灵活性：
+     - 在手动调度模式下可以设置 `distributed_inference_across_workers`为false（之前手动调度模式下，`distributed_inference_across_workers`只能为true）
+   - 添加了相关的 UI 界面。且，在安装时，UI 资源将从更新的 [gpustack-ui](https://github.com/xuan-wei/gpustack-ui) 下载
+
+2. 模型复用
+   - 运行时，通过添加`--ollama-path <local ollama path>` 参数，可以自动复用本地Ollama缓存的支持。如果不提供，则fallback 到之前的方案（重新下载一份到`cache-dir`）
+
+3. 调度增强
+   - 通过使用服务器端时间修复了工作节点时间服务器同步问题。这解决了当工作节点时间不正确时的同步错误。
+
+
 
 ### 核心特性
 
 - **广泛的硬件兼容性**：支持管理 Apple Mac、Windows PC 和 Linux 服务器上不同品牌的 GPU。
-- **广泛的模型支持**：从大语言模型 LLM、多模态模型 VLM 到 Diffusion 扩散模型、STT 与 TTS 语音模型、文本嵌入和重排序模型的广泛支持。
-- **异构 GPU 支持与扩展**：轻松添加异构 GPU 资源，按需扩展算力规模。
-- **分布式推理**：支持单机多卡并行和多机多卡并行推理。
+- **广泛的模型支持**：从大语言模型、扩散模型到语音、嵌入和重排序模型的广泛支持。
+- **GPU 资源扩展**：轻松添加更多 GPU 或节点来扩展运算能力。
+- **分布式推理**：支持单机多卡和多机多卡推理与服务。
 - **多推理后端支持**：支持 llama-box（基于 llama.cpp 和 stable-diffusion.cpp）、vox-box 和 vLLM 作为推理后端。
 - **轻量级 Python 包**：最小的依赖和操作开销。
 - **OpenAI 兼容 API**：提供兼容 OpenAI 标准的 API 服务。
