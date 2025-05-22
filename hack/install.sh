@@ -29,7 +29,14 @@ function download_ui() {
 
   gpustack::log::info "downloading ui assets"
 
-  if ! curl --retry 3 --retry-connrefused --retry-delay 3 -sSfL "https://gpustack-ui-1303613262.cos.accelerate.myqcloud.com/releases/${tag}.tar.gz" 2>/dev/null |
+  local download_url
+  if [[ "${tag}" == "latest" ]]; then
+    download_url="https://github.com/xuan-wei/gpustack-ui/releases/latest/download/latest.tar.gz"
+  else
+    download_url="https://github.com/xuan-wei/gpustack-ui/releases/download/${tag}/${tag}.tar.gz"
+  fi
+
+  if ! curl --retry 3 --retry-connrefused --retry-delay 3 -sSfL "${download_url}" 2>/dev/null |
     tar -xzf - --directory "${tmp_ui_path}/ui" 2>/dev/null; then
 
     if [[ "${tag:-}" =~ ^v([0-9]+)\.([0-9]+)(\.[0-9]+)?(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
@@ -37,7 +44,15 @@ function download_ui() {
     fi
 
     gpustack::log::warn "failed to download '${tag}' ui archive, fallback to '${default_tag}' ui archive"
-    if ! curl --retry 3 --retry-connrefused --retry-delay 3 -sSfL "https://gpustack-ui-1303613262.cos.accelerate.myqcloud.com/releases/${default_tag}.tar.gz" |
+    
+    local fallback_url
+    if [[ "${default_tag}" == "latest" ]]; then
+      fallback_url="https://github.com/xuan-wei/gpustack-ui/releases/latest/download/latest.tar.gz"
+    else
+      fallback_url="https://github.com/xuan-wei/gpustack-ui/releases/download/${default_tag}/${default_tag}.tar.gz"
+    fi
+
+    if ! curl --retry 3 --retry-connrefused --retry-delay 3 -sSfL "${fallback_url}" |
       tar -xzf - --directory "${tmp_ui_path}/ui" 2>/dev/null; then
       gpustack::log::fatal "failed to download '${default_tag}' ui archive"
     fi
@@ -46,13 +61,6 @@ function download_ui() {
 
   rm -rf "${tmp_ui_path}"
 
-  # from local
-  rm -rf "${ui_path}"
-  mkdir -p "${ui_path}"
-
-  gpustack::log::info "copying ui assets from ../gpustack-ui/dist"
-
-  cp -r "${ROOT_DIR}/../gpustack-ui/dist/." "${ui_path}/"
 }
 
 # Copy extra static files to ui including catalog icons
