@@ -1,5 +1,6 @@
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
+from datetime import datetime, timezone
 
 from gpustack.api.exceptions import (
     AlreadyExistsException,
@@ -77,6 +78,8 @@ async def update_worker(session: SessionDep, id: int, worker_in: WorkerUpdate):
         raise NotFoundException(message="worker not found")
 
     try:
+        # Always use server's time for heartbeat
+        worker_in.heartbeat_time = datetime.now(timezone.utc).replace(microsecond=0)
         worker_in.compute_state()
         await WorkerService(session).update(worker, worker_in)
     except Exception as e:
