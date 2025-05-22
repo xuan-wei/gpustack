@@ -49,6 +49,13 @@ class InferenceServerTypeWeight:
     rpc_server: int = 1  # max rpc server count is 3
 
 
+@dataclass
+class VendorPenalty:
+    """Vendor-specific scoring penalties"""
+
+    apple: float = 0.95  # Mac GPUs get 95% of their calculated score
+
+
 class ScaleTypeEnum(str, Enum):
     SCALE_UP = "scale_up"
     SCALE_DOWN = "scale_down"
@@ -65,6 +72,7 @@ class PlacementScorer(ScheduleCandidatesScorer, ModelInstanceScorer):
         self._resource_weight = ResourceWeight()
         self._model_weight = ModelWeight()
         self._inference_server_type_weight = InferenceServerTypeWeight()
+        self._vendor_penalty = VendorPenalty()
         self._scale_type = scale_type
 
     async def score(
@@ -146,6 +154,10 @@ class PlacementScorer(ScheduleCandidatesScorer, ModelInstanceScorer):
                     * len(candidate.subordinate_workers)
                 )
 
+            # Apply vendor penalty
+            final_score = self._apply_vendor_penalty(
+                final_score, candidate.worker, candidate.gpu_indexes
+            )
             candidate.score = final_score
 
         return candidates
@@ -199,6 +211,11 @@ class PlacementScorer(ScheduleCandidatesScorer, ModelInstanceScorer):
                     * len(subordinate_workers)
                 )
 
+            # Apply vendor penalty
+            final_score = self._apply_vendor_penalty(
+                final_score, worker, instance.gpu_indexes
+            )
+
             scored_instances.append(
                 ModelInstanceScore(model_instance=instance, score=final_score)
             )
@@ -214,10 +231,14 @@ class PlacementScorer(ScheduleCandidatesScorer, ModelInstanceScorer):
         worker_model_instances_count_map = await self._get_worker_model_instance_count()
 
         for candidate in candidates:
-            candidate.score = await self._score_spread_item(
+            score = await self._score_spread_item(
                 candidate.gpu_indexes,
                 candidate.worker,
                 worker_model_instances_count_map,
+            )
+            # Apply vendor penalty
+            candidate.score = self._apply_vendor_penalty(
+                score, candidate.worker, candidate.gpu_indexes
             )
 
         return candidates
@@ -242,6 +263,8 @@ class PlacementScorer(ScheduleCandidatesScorer, ModelInstanceScorer):
             score = await self._score_spread_item(
                 instance.gpu_indexes, worker, worker_model_instances_count_map
             )
+            # Apply vendor penalty
+            score = self._apply_vendor_penalty(score, worker, instance.gpu_indexes)
             scored_instances.append(
                 ModelInstanceScore(model_instance=instance, score=score)
             )
@@ -453,6 +476,34 @@ class PlacementScorer(ScheduleCandidatesScorer, ModelInstanceScorer):
                 + (worker_others_model_instance_count + 1) * self._model_weight.others
             )
             score += 70
+
+        return score
+    
+    def _apply_vendor_penalty(
+        self, score: float, worker: Worker, gpu_indexes: List[int] = None
+    ) -> float:
+        """Apply vendor-specific scoring penalties"""
+        if not worker or not worker.status or not worker.status.gpu_devices:
+            return score
+
+        # If specific GPU indexes are provided, check those GPUs
+        if gpu_indexes:
+            for gpu_index in gpu_indexes:
+                if gpu_index < len(worker.status.gpu_devices):
+                    gpu_device = worker.status.gpu_devices[gpu_index]
+                    if gpu_device.vendor == "Apple":
+                        score *= self._vendor_penalty.apple
+                        logger.debug(
+                            f"Applied Apple GPU penalty: score reduced to {score}"
+                        )
+                        break  # Apply penalty once for the worker
+        else:
+            # For CPU instances or when no specific GPU indexes, check if any GPU is Apple
+            for gpu_device in worker.status.gpu_devices:
+                if gpu_device.vendor == "Apple":
+                    score *= self._vendor_penalty.apple
+                    logger.debug(f"Applied Apple GPU penalty: score reduced to {score}")
+                    break  # Apply penalty once for the worker
 
         return score
 

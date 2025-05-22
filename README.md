@@ -31,6 +31,25 @@
 
 GPUStack is an open-source GPU cluster manager for running AI models.
 
+### Change from the Official GPUStack
+This is a fork from the official [GPUStack](https://github.com/gpustack/gpustack).
+
+Major Changes:
+1. Instance Management Improvements
+   - Implemented automatic instance start when requests arrive; adjust the number of replicas based on the demand/supply relationship in the past two mins.
+   - Added automatic unload functionality
+   - Added flexibility in distributed inference configuration:
+     - In manual scheduling mode, you can set `distributed_inference_across_workers` to false (previously in manual scheduling mode, `distributed_inference_across_workers` could only be true)
+   - Added relevant UI interface. During installation, UI resources will be downloaded from the updated [gpustack-ui](https://github.com/xuan-wei/gpustack-ui)
+
+2. Model Re-using
+   - At runtime, by adding the `--ollama-path <local ollama path>` parameter, you can automatically reuse local Ollama cache support. If not provided, it falls back to the previous approach (re-downloading to `cache-dir`)
+   - At runtime, by adding the `--model-scope-path <local modelscope path>` parameter, you can automatically reuse local ModelScope cache support. If not provided, it falls back to the previous approach (re-downloading to `cache-dir`)
+
+
+3. Scheduling Enhancements
+   - Fixed worker time server synchronization issues by using server-end time. This resolves synchronization errors when worker time is incorrect.
+
 ### Key Features
 
 - **Broad GPU Compatibility:** Seamlessly supports GPUs from various vendors across Apple Macs, Windows PCs, and Linux servers.

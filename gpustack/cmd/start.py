@@ -363,6 +363,13 @@ def setup_start_cmd(subparsers: argparse._SubParsersAction):
         action='append',
         help='HTTP request headers allowed in cross-origin requests. Specify the flag multiple times for multiple headers. Example: --allow-headers Authorization --allow-headers Content-Type. Default: ["Authorization", "Content-Type"].',
     )
+    group.add_argument(
+        "--model-scope-path",
+        type=str,
+        help="Path to the model scope directory. If set, downloaded modelscope models will be stored here for reuse. \
+            Use 'modelscope download --model=Qwen/Qwen2.5-0.5B-Instruct-GGUF --include qwen2.5-0.5b-instruct-q4_k_m.gguf' to test the path. E.g., if the result return '/data/shared/modelscope/hub/models/Qwen/Qwen2.5-0.5B-Instruct-GGUF', then, the path should be '/data/shared/modelscope/hub/models'",
+        default=get_gpustack_env("MODEL_SCOPE_PATH"),
+    )
 
     parser_server.set_defaults(func=run)
 
@@ -450,6 +457,7 @@ def set_config_option(args, config_data: dict, option_name: str):
 
 def set_common_options(args, config_data: dict):
     options = [
+        "model_scope_path",
         "debug",
         "data_dir",
         "cache_dir",

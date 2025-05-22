@@ -21,6 +21,7 @@ from gpustack.schemas.workers import (
 )
 from gpustack.utils import platform
 from gpustack.utils.platform import DeviceTypeEnum, device_type_from_vendor
+import time
 
 _config = None
 
@@ -78,6 +79,7 @@ class Config(BaseSettings):
         allow_credentials: Indicate that cookies should be supported for cross-origin requests.
         allow_methods: A list of HTTP methods that should be allowed for cross-origin requests.
         allow_headers: A list of HTTP request headers that should be supported for cross-origin requests.
+        model_scope_path: Optional[str] = None
     """
 
     # Common options
@@ -118,6 +120,7 @@ class Config(BaseSettings):
     allow_credentials: bool = False
     allow_methods: Optional[List[str]] = ['GET', 'POST']
     allow_headers: Optional[List[str]] = ['Authorization', 'Content-Type']
+    model_scope_path: Optional[str] = None
 
     # Worker options
     server_url: Optional[str] = None
@@ -237,6 +240,39 @@ class Config(BaseSettings):
         os.makedirs(self.cache_dir, exist_ok=True)
         os.makedirs(self.bin_dir, exist_ok=True)
         os.makedirs(self.log_dir, exist_ok=True)
+        self.setup_modelscope_cache()
+
+    def setup_modelscope_cache(self):
+        """Setup ModelScope cache directory and handle symbolic linking if model_scope_path is provided."""
+        modelscope_cache_dir = os.path.join(self.cache_dir, "model_scope")
+
+        if self.model_scope_path:
+            hub_models_path = self.model_scope_path
+
+            # Check if the source directory exists
+            if not os.path.exists(hub_models_path):
+                raise Exception(f"ModelScope path does not exist: {hub_models_path}")
+
+            # Remove existing symlink if it's invalid
+            if os.path.islink(modelscope_cache_dir):
+                if os.path.realpath(modelscope_cache_dir) != os.path.realpath(
+                    hub_models_path
+                ):
+                    os.unlink(modelscope_cache_dir)
+
+            # Create symlink if it doesn't exist
+            if not os.path.exists(modelscope_cache_dir) or not os.path.islink(
+                modelscope_cache_dir
+            ):
+                # Backup existing directory if it's not a symlink
+                if os.path.exists(modelscope_cache_dir) and not os.path.islink(
+                    modelscope_cache_dir
+                ):
+                    backup_dir = f"{modelscope_cache_dir}_backup_{int(time.time())}"
+                    os.rename(modelscope_cache_dir, backup_dir)
+
+                # Create the symlink
+                os.symlink(hub_models_path, modelscope_cache_dir)
 
     def get_system_info(self) -> SystemInfo:  # noqa: C901
         """get system info from resources

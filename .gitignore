@@ -2,6 +2,10 @@
 __pycache__/
 *.py[cod]
 *$py.class
+cache-dir/
+data-dir/
+gpustack-ui/
+.specstory/
 
 # C extensions
 *.so
