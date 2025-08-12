@@ -26,6 +26,9 @@ from gpustack.server.system_load import SystemLoadCollector
 from gpustack.server.update_check import UpdateChecker
 from gpustack.server.usage_buffer import flush_usage_to_db
 from gpustack.server.worker_syncer import WorkerSyncer
+from gpustack.server.auto_unload import AutoUnloadTask
+from gpustack.server.auto_metrics import AutoMetricsTask
+from gpustack.server.auto_scaling import AutoScalingTask
 from gpustack.utils.process import add_signal_handlers_in_loop
 
 
@@ -68,6 +71,9 @@ class Server:
         self._start_worker_syncer()
         self._start_update_checker()
         self._start_model_usage_flusher()
+        self._start_auto_unload_task()
+        self._start_auto_metrics_task()
+        self._start_auto_scaling_task()
         self._start_ray()
 
         port = 80
@@ -196,6 +202,34 @@ class Server:
         self._create_async_task(update_checker.start())
 
         logger.debug("Update checker started.")
+
+    def _start_auto_unload_task(self):
+        """Start the auto unload task."""
+
+        auto_unload_task = AutoUnloadTask(interval=30)  # Check every 30 seconds
+        self._create_async_task(auto_unload_task.start())
+
+        logger.debug("Auto unload task started.")
+
+    def _start_auto_metrics_task(self):
+        """Start the auto metrics task."""
+
+        auto_metrics_task = AutoMetricsTask(
+            interval=30
+        )  # Update metrics every 30 seconds
+        self._create_async_task(auto_metrics_task.start())
+
+        logger.debug("Auto metrics task started.")
+
+    def _start_auto_scaling_task(self):
+        """Start the auto scaling task."""
+
+        auto_scaling_task = AutoScalingTask(
+            interval=60
+        )  # Check scaling every 60 seconds
+        self._create_async_task(auto_scaling_task.start())
+
+        logger.debug("Auto scaling task started.")
 
     def _start_ray(self):
         if not self._config.enable_ray:

@@ -2,7 +2,8 @@ import asyncio
 from typing import AsyncGenerator, List, Optional, Tuple
 import aiohttp
 import logging
-
+import random
+import time
 from fastapi import APIRouter, Query, Request, Response, status
 from openai.types import Model as OAIModel
 from openai.pagination import SyncPage
@@ -27,18 +28,49 @@ from gpustack.schemas.models import (
     BackendEnum,
     CategoryEnum,
     Model,
+    ModelInstanceStateEnum,
+    ModelInstance,
 )
 from gpustack.server.db import get_engine
 from gpustack.server.deps import SessionDep
-from gpustack.server.services import ModelInstanceService, ModelService, WorkerService
+from gpustack.server.metrics_manager import metrics_manager
 
+from gpustack.server.services import ModelInstanceService, ModelService, WorkerService
 
 logger = logging.getLogger(__name__)
 
 load_balancer = LoadBalancer()
 
-
 aliasable_router = APIRouter()
+
+# 本地缓存每个 model_id 的上次更新时间
+last_update_time = {}
+last_update_lock = asyncio.Lock()
+UPDATE_INTERVAL = 5  # 秒
+
+CHECK_SCALING_INTERVAL = 60  # 秒
+UPDATE_REQUEST_RATE_INTERVAL = 10  # 秒
+
+
+# 更新模型的最后请求时间
+async def update_model_last_request_time(model):
+    """更新模型的最后请求时间，使用本地缓存减少数据库写操作"""
+    should_update = False
+    now = time.time()
+
+    async with last_update_lock:
+        last = last_update_time.get(model.id, 0)
+        if now - last > UPDATE_INTERVAL:
+            last_update_time[model.id] = now
+            should_update = True
+
+    if should_update:
+        async with AsyncSession(get_engine()) as session:
+            try:
+                model_service = ModelService(session)
+                await model_service.update_last_request_time(model.id)
+            except Exception as e:
+                logger.warning(f"Failed to update last_request_time: {e}")
 
 
 @aliasable_router.post("/chat/completions")
@@ -151,11 +183,16 @@ async def list_models(
     return result
 
 
-async def proxy_request_by_model(request: Request, endpoint: str):
+async def proxy_request_by_model(request: Request, endpoint: str):  # noqa: C901
     """
     Proxy the request to the model instance that is running the model specified in the
     request body.
     """
+    # Record request start time
+    request_start_time = time.time()
+
+    # Use short session to keep transactions short
+    # First session - parse request body and get model
     async with AsyncSession(get_engine()) as session:
         model, stream, body_json, form_data = await parse_request_body(request, session)
 
@@ -170,13 +207,30 @@ async def proxy_request_by_model(request: Request, endpoint: str):
 
         mutate_request(request, body_json, form_data)
 
-        instance = await get_running_instance(session, model.id)
-        worker = await WorkerService(session).get_by_id(instance.worker_id)
-        if not worker:
-            raise InternalServerErrorException(
-                message=f"Worker with ID {instance.worker_id} not found",
-                is_openai_exception=True,
-            )
+    # Record request start for metrics calculation
+    metrics_manager.record_request_start(model.id, request_start_time)
+
+    # Second session - update last request time（加本地缓存，减少写频率）
+    await update_model_last_request_time(model)
+
+    # Third session - get instance and worker
+    instance = None
+    worker = None
+
+    async with AsyncSession(get_engine()) as session:
+        try:
+            instance = await get_running_instance(session, model.id)
+            worker = await WorkerService(session).get_by_id(instance.worker_id)
+
+            # Validate instance and worker properties
+            if not instance or not worker:
+                raise InternalServerErrorException(
+                    message=f"Failed to get valid worker or instance for model {model.name}",
+                    is_openai_exception=True,
+                )
+        except Exception as e:
+            logger.error(f"Failed to get running instance: {e}")
+            raise
 
     url = f"http://{instance.worker_ip}:{worker.port}/proxy/v1/{endpoint}"
     token = request.app.state.server_config.token
@@ -196,11 +250,23 @@ async def proxy_request_by_model(request: Request, endpoint: str):
     try:
         if stream:
             return await handle_streaming_request(
-                request, url, body_json, form_data, extra_headers
+                request,
+                url,
+                body_json,
+                form_data,
+                extra_headers,
+                model,
+                request_start_time,
             )
         else:
             return await handle_standard_request(
-                request, url, body_json, form_data, extra_headers
+                request,
+                url,
+                body_json,
+                form_data,
+                extra_headers,
+                model,
+                request_start_time,
             )
     except asyncio.TimeoutError as e:
         error_message = f"Request to {url} timed out"
@@ -315,6 +381,8 @@ async def handle_streaming_request(
     body_json: Optional[dict],
     form_data: Optional[aiohttp.FormData],
     extra_headers: Optional[dict] = None,
+    model: Optional[Model] = None,
+    request_start_time: float = None,
 ):
     timeout = aiohttp.ClientTimeout(total=300)
     headers = filter_headers(request.headers)
@@ -343,6 +411,12 @@ async def handle_streaming_request(
 
                 async for chunk in _stream_response_chunks(resp):
                     yield chunk, resp.headers, resp.status
+
+                # Record request completion
+                if model:
+                    metrics_manager.record_request_completion(
+                        model.id, request_start_time, time.time()
+                    )
         except aiohttp.ClientError as e:
             error_response = OpenAIAPIErrorResponse(
                 error=OpenAIAPIError(
@@ -361,6 +435,15 @@ async def handle_streaming_request(
                 ),
             )
             yield error_response.model_dump_json(), {}, status.HTTP_500_INTERNAL_SERVER_ERROR
+        finally:
+            # Record request completion even on error
+            if model:
+                metrics_manager.record_request_completion(
+                    model.id, request_start_time, time.time()
+                )
+
+    # 更新模型最后请求时间
+    await update_model_last_request_time(model)
 
     return StreamingResponseWithStatusCode(
         stream_generator(), media_type="text/event-stream"
@@ -373,27 +456,46 @@ async def handle_standard_request(
     body_json: Optional[dict],
     form_data: Optional[aiohttp.FormData],
     extra_headers: Optional[dict] = None,
+    model: Optional[Model] = None,
+    request_start_time: float = None,
 ):
     headers = filter_headers(request.headers)
     if extra_headers:
         headers.update(extra_headers)
 
-    http_client: aiohttp.ClientSession = request.app.state.http_client
-    timeout = aiohttp.ClientTimeout(total=PROXY_TIMEOUT)
-    async with http_client.request(
-        method=request.method,
-        url=url,
-        headers=headers,
-        json=body_json if body_json else None,
-        data=form_data,
-        timeout=timeout,
-    ) as response:
-        content = await response.read()
-        return Response(
-            status_code=response.status,
-            headers=dict(response.headers),
-            content=content,
-        )
+    try:
+        http_client: aiohttp.ClientSession = request.app.state.http_client
+        timeout = aiohttp.ClientTimeout(total=PROXY_TIMEOUT)
+        async with http_client.request(
+            method=request.method,
+            url=url,
+            headers=headers,
+            json=body_json if body_json else None,
+            data=form_data,
+            timeout=timeout,
+        ) as response:
+            content = await response.read()
+            # Record request completion
+            if model:
+                metrics_manager.record_request_completion(
+                    model.id, request_start_time, time.time()
+                )
+
+            # 更新模型最后请求时间
+            await update_model_last_request_time(model)
+
+            return Response(
+                status_code=response.status,
+                headers=dict(response.headers),
+                content=content,
+            )
+    except Exception as e:
+        # Record request completion even on error
+        if model:
+            metrics_manager.record_request_completion(
+                model.id, request_start_time, time.time()
+            )
+        raise e
 
 
 def filter_headers(headers):
@@ -408,16 +510,147 @@ def filter_headers(headers):
     }
 
 
-async def get_running_instance(session: AsyncSession, model_id: int):
-    running_instances = await ModelInstanceService(session).get_running_instances(
-        model_id
+async def get_running_instance(session: AsyncSession, model_id: int):  # noqa: C901
+    """
+    Get a running instance for the model, or start instances if needed.
+    Returns a running instance for the model.
+    """
+    # First check for already running instances
+    running_instances = await ModelInstanceService(
+        session
+    ).get_running_instances_no_cache(model_id)
+
+    model = await Model.one_by_id(session, model_id)
+    logger.debug(
+        f"Found {len(running_instances)} running instances for model {model.name}"
     )
-    if not running_instances:
-        raise ServiceUnavailableException(
-            message="No running instances available",
-            is_openai_exception=True,
+
+    if not model.auto_load:
+        if len(running_instances) > 0:
+            return await load_balancer.get_instance(running_instances)
+        else:
+            raise ServiceUnavailableException(
+                message=f"Auto-load is disabled for model {model.name}. Please start the model manually.",
+                is_openai_exception=True,
+            )
+
+    # For auto_load enabled models
+    if model.auto_adjust_replicas:  # just wait for the periodic auto_scaling
+        desired_replicas = (
+            model.replicas if model.replicas > 0 else model.auto_load_replicas // 2
         )
-    return await load_balancer.get_instance(running_instances)
+        if desired_replicas == 0:
+            desired_replicas = 1
+    else:
+        desired_replicas = model.auto_load_replicas
+
+    # Return existing running instance or handle auto-load
+    return await _handle_auto_load(session, model, running_instances, desired_replicas)
+
+
+async def _handle_auto_load(
+    session: AsyncSession,
+    model: Model,
+    running_instances: List[ModelInstance],
+    desired_replicas: int,
+) -> ModelInstance:
+    """Handle auto-loading logic for model instances using desired_replicas."""
+    # auto_load is enabled
+    if len(running_instances) > desired_replicas:
+        # If we have more running instances than desired_replicas, we need to stop some instances
+        # if there are error instances, will stop it BTW
+
+        if model.replicas > desired_replicas:
+            logger.info(
+                f"Stopping {model.replicas - desired_replicas} instances for model {model.name}"
+            )
+            model.replicas = desired_replicas
+            await model.update(session)
+
+        # Sort running instances by creation time
+        running_instances.sort(key=lambda x: x.created_at, reverse=True)
+        return await load_balancer.get_instance(running_instances[:desired_replicas])
+
+    elif len(running_instances) == desired_replicas:
+        logger.debug(
+            f"Number of running instance equals to desired_replicas for model {model.name}"
+        )
+
+        if model.replicas > desired_replicas:
+            logger.info(
+                f"Stopping {model.replicas - desired_replicas} instances for model {model.name}"
+            )
+            model.replicas = desired_replicas
+            await model.update(session)
+
+        return await load_balancer.get_instance(running_instances)
+
+    else:
+        # Set replicas to desired_replicas + len(error_instances) to trigger instance creation
+        model_instances = await ModelInstance.all_by_field(
+            session=session, field="model_id", value=model.id
+        )
+
+        error_instances = [
+            inst
+            for inst in model_instances
+            if inst.state == ModelInstanceStateEnum.ERROR
+        ]
+        target = len(error_instances) + desired_replicas
+        if model.replicas < target:
+            logger.info(
+                f"Setting replicas from {model.replicas} to {target} for model {model.name} to trigger instance creation"
+            )
+            model.replicas = target
+            await model.update(session)
+
+        # Wait for instances to be ready with timeout
+        wait_start_time = asyncio.get_event_loop().time()
+        timeout = 120
+
+        while True:
+            # Re-check running instances
+            running_instances = await ModelInstanceService(
+                session
+            ).get_running_instances_no_cache(model.id)
+
+            if running_instances:
+                logger.debug(
+                    f"Found {len(running_instances)} running instances for model {model.name}"
+                )
+                # Validate instances
+                valid_instances = [
+                    instance
+                    for instance in running_instances
+                    if instance
+                    and instance.worker_ip
+                    and instance.port
+                    and instance.worker_id
+                ]
+
+                if valid_instances:
+                    logger.debug(
+                        f"Found {len(valid_instances)} valid running instances for model {model.name}"
+                    )
+                    return await load_balancer.get_instance(valid_instances)
+                else:
+                    logger.debug(
+                        f"No valid instances found for model {model.name}, will retry"
+                    )
+
+            # Check timeout
+            elapsed = asyncio.get_event_loop().time() - wait_start_time
+            if elapsed > timeout:
+                raise ServiceUnavailableException(
+                    message=f"Timeout after waiting for 2 minutes. No instances ready for model {model.name}.",
+                    is_openai_exception=True,
+                )
+
+            # Wait before checking again
+            logger.debug(
+                f"Waiting for instances to start for model {model.name}, elapsed time: {elapsed:.1f}s"
+            )
+            await asyncio.sleep(random.uniform(2, 5))
 
 
 def mutate_request(

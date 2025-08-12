@@ -142,6 +142,39 @@ class ModelSpecBase(SQLModel, ModelSource):
 
     replicas: int = Field(default=1, ge=0)
     ready_replicas: int = Field(default=0, ge=0)
+    auto_load: int = Field(
+        default=1, description="Whether to auto-load instances when requests come in"
+    )
+    auto_load_replicas: int = Field(
+        default=1, description="Number of replicas to auto-load when requests come in"
+    )
+    auto_unload: int = Field(
+        default=0, description="Whether to auto-offload instances after timeout"
+    )
+    auto_unload_timeout: int = Field(
+        default=120,
+        description="Seconds of inactivity before auto-offloading a model instance",
+    )
+    auto_adjust_replicas: int = Field(
+        default=0,
+        description="Whether to auto-adjust replicas based on demand/supply ratio",
+    )
+    avg_request_rate: float = Field(
+        default=0.0, description="Average requests per minute"
+    )
+    avg_process_rate: float = Field(
+        default=0.0,
+        description="Average requests processed per minute (1/avg_finish_time)",
+    )
+    last_scale_time: Optional[datetime] = Field(
+        sa_column=Column(UTCDateTime), default=None
+    )
+    last_scale_message: Optional[str] = Field(
+        default=None, description="Message of the last scaling operation"
+    )
+    last_request_time: Optional[datetime] = Field(
+        sa_column=Column(UTCDateTime), default=None
+    )
     categories: List[str] = Field(sa_column=Column(JSON), default=[])
     embedding_only: Annotated[
         bool,
@@ -222,6 +255,21 @@ class ModelBase(ModelSpecBase):
 class Model(ModelBase, BaseModelMixin, table=True):
     __tablename__ = 'models'
     id: Optional[int] = Field(default=None, primary_key=True)
+
+    # Request tracking metrics for auto-scaling (per minute)
+    avg_request_rate: float = Field(
+        default=0.0, description="Average requests per minute"
+    )
+    avg_process_rate: float = Field(
+        default=0.0,
+        description="Average requests processed per minute (1/avg_finish_time)",
+    )
+    last_scale_time: Optional[datetime] = Field(
+        sa_column=Column(UTCDateTime), default=None
+    )
+    last_scale_message: Optional[str] = Field(
+        default=None, description="Message of the last scaling operation"
+    )
 
     instances: list["ModelInstance"] = Relationship(
         sa_relationship_kwargs={"cascade": "delete", "lazy": "selectin"},

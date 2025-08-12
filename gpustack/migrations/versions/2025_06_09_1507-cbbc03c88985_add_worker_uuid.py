@@ -1,7 +1,7 @@
 """GPUStack v0.7.0
 
 Revision ID: cbbc03c88985
-Revises: c45e397531d1
+Revises: 9e2571d3a213
 Create Date: 2025-06-09 15:07:05.299418
 
 """
@@ -16,7 +16,7 @@ import gpustack
 
 # revision identifiers, used by Alembic.
 revision: str = 'cbbc03c88985'
-down_revision: Union[str, None] = 'c45e397531d1'
+down_revision: Union[str, None] = '9e2571d3a213'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

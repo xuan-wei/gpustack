@@ -2,6 +2,7 @@ import asyncio
 import logging
 import time
 import re
+import os
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     create_async_engine,
@@ -11,6 +12,9 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlalchemy import DDL, event
 
 from gpustack.config.envs import DB_ECHO, DB_MAX_OVERFLOW, DB_POOL_SIZE, DB_POOL_TIMEOUT
+from sqlalchemy.exc import OperationalError, DBAPIError
+import random
+import asyncio
 from gpustack.schemas.api_keys import ApiKey
 from gpustack.schemas.model_usage import ModelUsage
 from gpustack.schemas.models import Model, ModelInstance
@@ -31,6 +35,10 @@ logger = logging.getLogger(__name__)
 SLOW_QUERY_THRESHOLD_SECOND = 0.5
 
 _engine = None
+DB_ECHO = os.getenv("GPUSTACK_DB_ECHO", "false").lower() == "true"
+DB_POOL_SIZE = int(os.getenv("GPUSTACK_DB_POOL_SIZE", 50))
+DB_MAX_OVERFLOW = int(os.getenv("GPUSTACK_DB_MAX_OVERFLOW", 500))
+DB_POOL_TIMEOUT = int(os.getenv("GPUSTACK_DB_POOL_TIMEOUT", 30))
 
 
 def get_engine():
@@ -137,3 +145,30 @@ def after_cursor_execute(conn, cursor, statement, parameters, context, executema
     total = time.time() - context._query_start_time
     if total > SLOW_QUERY_THRESHOLD_SECOND:
         logger.debug(f"[SLOW SQL] {total:.3f}s\nSQL: {statement}\nParams: {parameters}")
+
+async def retry_on_db_lock(func, max_retries=5, initial_delay=0.1):
+    """
+    Retry a database operation when SQLite database is locked.
+    Uses exponential backoff.
+    """
+    retries = 0
+    delay = initial_delay
+
+    while True:
+        try:
+            return await func()
+        except (OperationalError, DBAPIError) as e:
+            error_text = str(e).lower()
+            if "database is locked" in error_text or "deadlock detected" in error_text:
+                retries += 1
+                if retries > max_retries:
+                    raise
+
+                # Exponential backoff with jitter
+                jitter = random.uniform(0.8, 1.2)
+                sleep_time = delay * jitter
+                await asyncio.sleep(sleep_time)
+                delay *= 2  # Exponential backoff
+            else:
+                # Not a locking error, re-raise
+                raise
