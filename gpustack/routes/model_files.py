@@ -1,3 +1,4 @@
+import logging
 from typing import Optional
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
@@ -20,6 +21,7 @@ from gpustack.schemas.model_files import (
 )
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 @router.get("", response_model=ModelFilesPublic)
@@ -197,6 +199,21 @@ async def reset_model_file(session: SessionDep, id: int):
         raise NotFoundException(message=f"Model file {id} not found")
 
     try:
+        # Clean any stale lock files when user clicks reset
+        from gpustack.utils.model_lock_cleaner import clean_model_lock_files_for_reset
+        from gpustack.config.config import get_global_config
+
+        try:
+            config = get_global_config()
+            cleaned = clean_model_lock_files_for_reset(model_file, config.cache_dir)
+            if cleaned:
+                logger.info(
+                    f"Cleaned stale lock files for reset: {model_file.readable_source}"
+                )
+        except Exception as e:
+            logger.warning(f"Failed to clean lock files during reset: {e}")
+            # Continue anyway - user explicitly requested reset
+
         model_file.state = ModelFileStateEnum.DOWNLOADING
         model_file.download_progress = 0
         model_file.state_message = ""

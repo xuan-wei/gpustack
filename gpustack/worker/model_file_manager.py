@@ -306,6 +306,26 @@ class ModelFileDownloadTask:
 
     def _download_model_file(self):
         logger.info(f"Downloading model file {self._model_file.readable_source}")
+
+        # Simple automatic lock cleanup to reduce manual reset frequency
+        try:
+            from gpustack.utils.model_lock_cleaner import (
+                clean_model_lock_files_for_reset,
+            )
+
+            cleaned = clean_model_lock_files_for_reset(
+                self._model_file, self._config.cache_dir
+            )
+            if cleaned:
+                logger.info(
+                    f"Auto-cleaned stale lock files before download: {self._model_file.readable_source}"
+                )
+        except Exception as e:
+            logger.debug(
+                f"Auto lock cleanup failed (will fallback to manual reset): {e}"
+            )
+            # Continue anyway - user can always use manual reset as backup
+
         model_paths = downloaders.download_model(
             self._model_file,
             local_dir=self._model_file.local_dir,
