@@ -31,6 +31,7 @@ from gpustack.utils.command import (
     extend_args_no_exist,
 )
 from gpustack.utils.envs import sanitize_env
+from gpustack.utils.gpu_memory_range import resolve_vllm_gmu_override
 from gpustack.utils.unit import byte_to_gib
 from gpustack.worker.backends.base import (
     InferenceServer,
@@ -494,6 +495,17 @@ class VLLMServer(InferenceServer):
 
         # Inject user-defined backend parameters
         arguments.extend(self._flatten_backend_param())
+
+        # Apply the custom GPU memory range: clamp ``--gpu-memory-utilization``
+        # to honor the absolute VRAM bounds the user set on the model. Anchored
+        # on the smallest effective gmu across this worker's selected GPUs so
+        # the strictest card wins (matches the scheduler-side claim logic in
+        # ``vllm_resource_fit_selector``).
+        gmu_override = resolve_vllm_gmu_override(
+            self._model, self._get_selected_gpu_devices() or []
+        )
+        if gmu_override is not None:
+            arguments.extend(["--gpu-memory-utilization", f"{gmu_override:.4f}"])
 
         # Append immutable arguments to ensure proper operation for accessing
         # Only add if not already present in arguments

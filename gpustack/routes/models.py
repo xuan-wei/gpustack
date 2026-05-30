@@ -360,6 +360,7 @@ async def validate_gpu_ids(  # noqa: C901
         is_custom_backend(model_backend)
         and len(worker_name_set) > 1
         and model_in.replicas == 1
+        and model_in.distributed_inference_across_workers
     ):
         raise BadRequestException(
             message="Distributed inference across multiple workers is not supported for custom backends."
@@ -404,6 +405,10 @@ async def validate_distributed_vllm_limit_per_worker(
 
 @router.post("", response_model=ModelPublic)
 async def create_model(session: SessionDep, model_in: ModelCreate):
+    # Normalize colon → hyphen so users can type Ollama/HF-style names
+    # (e.g. "qwen2.5:14b") while keeping the stored name route-safe.
+    if model_in.name:
+        model_in.name = model_in.name.replace(":", "-")
     existing = await Model.one_by_field(session, "name", model_in.name)
     if existing:
         raise AlreadyExistsException(

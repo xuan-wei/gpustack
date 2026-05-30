@@ -26,6 +26,7 @@ from gpustack.policies.utils import (
     get_computed_ram_claim,
     sort_workers_by_gpu_count,
 )
+from gpustack.utils.gpu_memory_range import effective_gpu_memory_utilization
 from gpustack.schemas.models import (
     CategoryEnum,
     ComputedResourceClaim,
@@ -149,6 +150,21 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
         )
         if gmu:
             self._gpu_memory_utilization = float(gmu)
+
+    def _effective_gmu_for_gpu(self, gpu_total_bytes: int) -> float:
+        """
+        Apply the model's optional absolute VRAM range (in GiB) on top of
+        the base ``--gpu-memory-utilization``. Per-GPU because the same
+        absolute bound translates to different ratios depending on each
+        card's total VRAM. Used everywhere the scorer would otherwise read
+        ``self._gpu_memory_utilization`` against a specific GPU.
+        """
+        return effective_gpu_memory_utilization(
+            self._gpu_memory_utilization,
+            gpu_total_bytes,
+            getattr(self._model, "gpu_memory_min_gib", None),
+            getattr(self._model, "gpu_memory_max_gib", None),
+        )
 
     def _disable_gpu_memory_utilization(self) -> bool:
         """
@@ -406,21 +422,22 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
             if gpu.memory is None or gpu.memory.total == 0:
                 continue
 
+            eff_gmu = self._effective_gmu_for_gpu(gpu.memory.total)
+
             exceeds_vram = (
-                self._vram_claim > gpu.memory.total * self._gpu_memory_utilization
-                if self._gpu_memory_utilization > 0  # LLMs
+                self._vram_claim > gpu.memory.total * eff_gmu
+                if eff_gmu > 0  # LLMs
                 else self._vram_claim > allocatable_vram  # non LLMs
             )
             exceeds_memory_utilization = (
-                self._gpu_memory_utilization > 0
-                and allocatable_gpu_memory_utilization < self._gpu_memory_utilization
+                eff_gmu > 0 and allocatable_gpu_memory_utilization < eff_gmu
             )
             if exceeds_vram or exceeds_memory_utilization:
                 continue
 
             vram_claim_bytes = (
-                int(gpu.memory.total * self._gpu_memory_utilization)
-                if self._gpu_memory_utilization > 0  # LLMs
+                int(gpu.memory.total * eff_gmu)
+                if eff_gmu > 0  # LLMs
                 else int(self._vram_claim)  # non LLMs
             )
 
@@ -510,7 +527,8 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
             allocatable_vram = allocatable.vram.get(gpu.index, 0)
             total_allocatable_vram += allocatable_vram
 
-            if allocatable_vram / gpu.memory.total > self._gpu_memory_utilization:
+            eff_gmu = self._effective_gmu_for_gpu(gpu.memory.total)
+            if allocatable_vram / gpu.memory.total > eff_gmu:
                 satisfied_gpu_count += 1
                 gpu_list.append(gpu)
 
@@ -526,6 +544,17 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
             reverse=True,
         )
 
+        # Anchor on the smallest effective GMU across this worker's eligible
+        # GPUs so the most-constrained card dictates the per-GPU claim. This
+        # keeps vRAM bookkeeping aligned with what vLLM will actually reserve
+        # (single ratio applied uniformly across TP ranks) and releases the
+        # surplus on larger cards for other replicas.
+        eff_gmu_anchor = self._gpu_memory_utilization
+        if sorted_gpu_devices and self._gpu_memory_utilization > 0:
+            eff_gmu_anchor = min(
+                self._effective_gmu_for_gpu(g.memory.total) for g in sorted_gpu_devices
+            )
+
         vram_sum = 0
         gpu_sum = 0
         gpu_indexes = []
@@ -534,8 +563,8 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
         for _, gpu in enumerate(sorted_gpu_devices):
             gpu_indexes.append(gpu.index)
             vram_claim[gpu.index] = (
-                int(gpu.memory.total * self._gpu_memory_utilization)
-                if self._gpu_memory_utilization > 0  # LLMs
+                int(gpu.memory.total * eff_gmu_anchor)
+                if eff_gmu_anchor > 0  # LLMs
                 else allocatable.vram.get(gpu.index, 0)  # non LLMs
             )
             gpu_sum += 1
@@ -656,7 +685,7 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
                     or gpu.memory.total is None
                     or (
                         allocatable.vram.get(gpu.index, 0) / gpu.memory.total
-                        < self._gpu_memory_utilization
+                        < self._effective_gmu_for_gpu(gpu.memory.total)
                     )
                     for gpu in worker.status.gpu_devices
                 ):
@@ -665,7 +694,10 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
                 selected_workers.append(worker)
                 gpu_sum += gpu_count
                 vram_sum += sum(
-                    int(gpu.memory.total * (self._gpu_memory_utilization or 1))
+                    int(
+                        gpu.memory.total
+                        * (self._effective_gmu_for_gpu(gpu.memory.total) or 1)
+                    )
                     for gpu in worker.status.gpu_devices
                 )
 

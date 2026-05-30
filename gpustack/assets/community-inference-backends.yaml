@@ -100,7 +100,10 @@
       image_name: ghcr.io/ggml-org/llama.cpp:server-rocm
       custom_framework: rocm
   default_version: cpu
-  default_run_command: -m {{model_path}} --host 0.0.0.0 --port {{port}} --alias {{model_name}}
+  default_run_command: -m {{model_path}} --host 0.0.0.0 --port {{port}} --alias {{model_name}} --metrics
+  default_backend_param:
+    - --ctx-size 81920
+    - --parallel 10
   is_built_in: false
   health_check_path: /v1/models
   framework_index_map:

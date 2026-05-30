@@ -289,6 +289,23 @@ scrape_configs:
           - 127.0.0.1:{cfg.metrics_port}
 """
         )
+        # Custom: scrape the embedded Higress gateway so dashboards can derive
+        # request/token/latency metrics across backends (including llama.cpp,
+        # which natively exposes none of these).
+        if cfg.gateway_mode == GatewayModeEnum.embedded:
+            f.write(
+                """  - job_name: gpustack-gateway
+    scrape_interval: 15s
+    static_configs:
+      - targets:
+          - 127.0.0.1:15020
+    metrics_path: /stats/prometheus
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'route_upstream_model_consumer_metric_(input_token|output_token|total_token|llm_duration_count|llm_service_duration)'
+        action: keep
+"""
+            )
 
     grafana_provisioning_dir = os.getenv(
         "GF_PATHS_PROVISIONING", "/etc/grafana/provisioning"

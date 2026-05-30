@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime, timezone
 from typing import Optional, Annotated
 from fastapi.security import HTTPAuthorizationCredentials
 from fastapi import APIRouter, Request, Response, Depends
@@ -11,8 +12,21 @@ from gpustack.api.exceptions import (
 from gpustack.server.services import ModelRouteService, UserService
 from gpustack.schemas.api_keys import ApiKey
 from gpustack.schemas.users import User
-from gpustack.schemas.models import AccessPolicyEnum
+from gpustack.schemas.models import (
+    AccessPolicyEnum,
+    Model,
+)
 from gpustack.server.deps import SessionDep
+from gpustack.utils.auto_load import (
+    FAILED,
+    READY,
+    poll_until_ready,
+    resolve_route_model_ids,
+)
+from gpustack.utils.cold_start_gate import (
+    ColdStartCapacityExceeded,
+    cold_start_slot,
+)
 from gpustack.api.auth import (
     api_key_header_auth,
     basic_auth,
@@ -35,6 +49,94 @@ model_not_found_exception = NotFoundException(
     message="Model not found",
     is_openai_exception=True,
 )
+
+AUTO_LOAD_FAIL_RETRY_AFTER = "30"
+AUTO_LOAD_LOADING_RETRY_AFTER = "10"
+
+
+def _loading_failed_response(msg: str) -> Response:
+    return Response(
+        status_code=503,
+        headers={"Retry-After": AUTO_LOAD_FAIL_RETRY_AFTER},
+        media_type="application/json",
+        content=f'{{"error":{{"message":"{msg}","type":"model_loading_failed"}}}}',
+    )
+
+
+async def _try_auto_load(session, model_name: str) -> Optional[Response]:
+    model_ids = await resolve_route_model_ids(session, model_name)
+    if not model_ids:
+        return None
+
+    models = await Model.all_by_fields(
+        session, fields={}, extra_conditions=[Model.id.in_(model_ids)]
+    )
+
+    needs_loading = False
+    now = datetime.now(timezone.utc)
+    for model in models:
+        if model.auto_load:
+            target = max(model.auto_load_replicas, 1)
+            if model.replicas == 0:
+                model.replicas = target
+                model.last_request_time = now
+                await model.update(session)
+                needs_loading = True
+                logger.info(
+                    f"Auto-load triggered for model {model.name}, "
+                    f"scaling to {model.replicas} replicas"
+                )
+                continue
+            if not model.auto_adjust_replicas and model.replicas < target:
+                previous = model.replicas
+                model.replicas = target
+                model.last_request_time = now
+                await model.update(session)
+                needs_loading = True
+                logger.info(
+                    f"Replica scaled up for model {model.name}: "
+                    f"{previous} -> {target}"
+                )
+                continue
+        if model.replicas > 0 and model.ready_replicas == 0:
+            needs_loading = True
+        elif model.replicas > 0 and model.ready_replicas > 0 and model.auto_unload:
+            # Refresh idle timer on each request to a running model so
+            # AutoUnloadTask doesn't fire on a stale last_request_time.
+            if (
+                model.last_request_time is None
+                or (now - model.last_request_time).total_seconds() > 5
+            ):
+                model.last_request_time = now
+                await model.update(session)
+
+    if not needs_loading:
+        return None
+
+    # Gate the long-poll wait per model (same gate as the openai.py fallback
+    # path), so a burst of auth requests to a cold model can't pin N handlers
+    # in the 300s poll and exhaust the asyncio/DB pools.
+    try:
+        async with cold_start_slot(model_name):
+            result = await poll_until_ready(model_ids)
+    except ColdStartCapacityExceeded as exc:
+        logger.warning(str(exc))
+        return _loading_failed_response(
+            f"Model is cold-starting and reached its waiter cap ({exc.cap}), "
+            f"please retry"
+        )
+
+    if result.outcome == READY:
+        return None
+    if result.outcome == FAILED:
+        return _loading_failed_response(result.message or "Model failed to load")
+
+    return Response(
+        status_code=503,
+        headers={"Retry-After": AUTO_LOAD_LOADING_RETRY_AFTER},
+        media_type="application/json",
+        content='{"error":{"message":"Model is still loading, please retry","type":"model_loading"}}',
+    )
 
 
 @router.get("")
@@ -97,6 +199,11 @@ async def server_auth(
             raise ForbiddenException(
                 message=f"Api key not allowed to access model {model_name}"
             )
+
+    auto_load_response = await _try_auto_load(session, model_name)
+    if auto_load_response is not None:
+        return auto_load_response
+
     headers = {
         "X-Mse-Consumer": consumer,
         "Authorization": f"Bearer {registration_token}",

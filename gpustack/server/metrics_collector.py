@@ -31,6 +31,7 @@ metrics_names = {
     "route_upstream_model_consumer_metric_output_token": "output_token",
     "route_upstream_model_consumer_metric_total_token": "total_token",
     "route_upstream_model_consumer_metric_llm_duration_count": "request_count",
+    "route_upstream_model_consumer_metric_llm_service_duration": "llm_service_duration",
 }
 
 
@@ -41,6 +42,7 @@ class ModelUsageMetrics:
     output_token: int = 0
     total_token: int = 0
     request_count: int = 0
+    llm_service_duration: int = 0
     user_id: Optional[int] = None
     model_id: Optional[int] = None
     provider_id: Optional[int] = None
@@ -88,6 +90,8 @@ def parse_token_metrics(metrics_text) -> Dict[str, ModelUsageMetrics]:
                     existing_metrics.total_token = metrics.total_token
                 if metrics.request_count:
                     existing_metrics.request_count = metrics.request_count
+                if metrics.llm_service_duration:
+                    existing_metrics.llm_service_duration = metrics.llm_service_duration
     return metrics_by_model_user_access_key
 
 
@@ -235,6 +239,7 @@ class GatewayMetricsCollector:
                 copied_metric.output_token -= cached_metric.output_token
                 copied_metric.total_token -= cached_metric.total_token
                 copied_metric.request_count -= cached_metric.request_count
+                copied_metric.llm_service_duration -= cached_metric.llm_service_duration
             # Skip if all delta values are zero (no change)
             if (
                 copied_metric.input_token == 0

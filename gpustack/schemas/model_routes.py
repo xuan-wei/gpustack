@@ -31,6 +31,12 @@ if TYPE_CHECKING:
 name_pattern = r'^[A-Za-z](?:[A-Za-z0-9_\-\.]*[A-Za-z0-9])?$'
 
 
+def normalize_name(v: str) -> str:
+    """Replace colons with hyphens so users can type Ollama/HF-style names
+    (e.g. ``qwen2.5:14b``) while the stored name stays K8s-safe."""
+    return v.replace(":", "-")
+
+
 class AccessPolicyEnum(str, Enum):
     PUBLIC = "public"
     AUTHED = "authed"
@@ -137,6 +143,7 @@ class ModelRouteTargetBase(ModelRouteTargetCreate):
     def validate_route_name(cls, v):
         if not isinstance(v, str):
             raise ValueError("route_name must be a string")
+        v = normalize_name(v)
         if not re.match(name_pattern, v):
             raise ValueError(
                 "route_name must start with a letter, only contain letters, numbers, hyphens, underscores, and not end with hyphen or underscore"
@@ -215,6 +222,7 @@ class ModelRouteUpdateBase(SQLModel):
     def validate_name(cls, v):
         if not isinstance(v, str):
             raise ValueError("name must be a string")
+        v = normalize_name(v)
         if not re.match(name_pattern, v):
             raise ValueError(
                 "name must start with a letter, only contain letters, numbers, hyphens, underscores, and not end with hyphen or underscore"

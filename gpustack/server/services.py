@@ -1,4 +1,6 @@
 from typing import List, Optional, Union, Set, Tuple
+from datetime import datetime, timezone
+import logging
 from sqlmodel import SQLModel, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -29,6 +31,9 @@ from gpustack.server.cache import (
     set_cache_by_key,
     locked_cached,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class UserService:
@@ -320,6 +325,17 @@ class ModelService:
         await delete_cache_by_key(self.get_by_id, model.id)
         await delete_cache_by_key(self.get_by_name, model.name)
         return result
+
+    async def update_last_request_time(self, model_id: int) -> None:
+        model = await Model.one_by_id(self.session, model_id)
+        if model is None:
+            return
+
+        model.last_request_time = datetime.now(timezone.utc)
+        await model.update(self.session)
+        await delete_cache_by_key(self.get_by_id, model.id)
+        await delete_cache_by_key(self.get_by_name, model.name)
+        logger.debug(f"Updated last_request_time for model {model.name}")
 
 
 class ModelInstanceService:

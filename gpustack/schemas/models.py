@@ -198,6 +198,23 @@ class ModelSpecBase(SQLModel, ModelSource):
 
     replicas: int = Field(default=1, ge=0)
     ready_replicas: int = Field(default=0, ge=0)
+    auto_load: int = Field(default=1)
+    auto_load_replicas: int = Field(default=1)
+    auto_unload: int = Field(default=0)
+    auto_unload_timeout: int = Field(default=10)
+    auto_adjust_replicas: int = Field(default=0)
+    scale_window_minutes: int = Field(default=5, ge=1)
+    scale_down_kv_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
+    # Absolute VRAM range (GiB) used to clamp the ratio-based
+    # ``--gpu-memory-utilization`` at scheduling and launch time.
+    # ``None`` means pass-through. min == max is a fixed value.
+    gpu_memory_min_gib: Optional[int] = Field(default=None, ge=0)
+    gpu_memory_max_gib: Optional[int] = Field(default=None, ge=0)
+    avg_request_rate: float = Field(default=0.0)
+    avg_process_rate: float = Field(default=0.0)
+    last_scale_time: Optional[datetime] = Field(sa_type=UTCDateTime, default=None)
+    last_scale_message: Optional[str] = Field(default=None)
+    last_request_time: Optional[datetime] = Field(sa_type=UTCDateTime, default=None)
     categories: List[str] = Field(sa_type=JSON, default=[])
     placement_strategy: PlacementStrategyEnum = PlacementStrategyEnum.SPREAD
     cpu_offloading: Optional[bool] = None
@@ -462,6 +479,7 @@ class ModelInstanceBase(SQLModel, ModelSource):
     state_message: Optional[str] = Field(
         default=None, sa_column=Column(Text, nullable=True)
     )
+    is_draining: bool = Field(default=False, nullable=False)
     computed_resource_claim: Optional[ComputedResourceClaim] = Field(
         sa_column=Column(pydantic_column_type(ComputedResourceClaim)), default=None
     )

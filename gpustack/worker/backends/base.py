@@ -874,7 +874,16 @@ exec "$@"
             self._model.backend_parameters = ["--ctx-size 1024"] -> ["--ctx-size", "1024"]
             self._model.backend_parameters = [" --ctx-size=1024"] -> ["--ctx-size=1024"]
             self._model.backend_parameters = ["--ctx-size =1024"] -> ["--ctx-size=1024"]
+
+        For backends whose CLI parser does not understand `--flag=value` form
+        (notably llama.cpp's llama-server, which iterates argv looking for exact
+        flag-name matches and treats the next argv as the value), the `=` form
+        is normalized into two separate tokens.
         """
+        # llama-server (community llama.cpp backend) rejects `--flag=value`;
+        # split it into two tokens so users can write either form in the UI.
+        expand_eq = self._model.backend == "llama.cpp"
+
         result = []
         for param in self._model.backend_parameters or []:
             # Strip leading/trailing whitespace
@@ -884,7 +893,12 @@ exec "$@"
                 # Handle cases like "--foo = bar" or "--foo  =bar"
                 # Split by = and strip whitespace around it
                 key, value = map(str.strip, param_stripped.split("=", 1))
-                result.append(f"{key}={value}")
+                if expand_eq:
+                    result.append(key)
+                    if value:
+                        result.append(value)
+                else:
+                    result.append(f"{key}={value}")
                 continue
 
             result.extend(shlex.split(param_stripped))

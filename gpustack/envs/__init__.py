@@ -10,9 +10,29 @@ DB_POOL_TIMEOUT = int(os.getenv("GPUSTACK_DB_POOL_TIMEOUT", 30))
 
 # Proxy configuration
 PROXY_TIMEOUT = int(os.getenv("GPUSTACK_PROXY_TIMEOUT_SECONDS", 1800))
+# Connect timeout: how long aiohttp waits to *establish* the upstream TCP
+# connection. Default 5s — when the upstream container is killed/wedged, this
+# fails fast and lets the handler release its slot, instead of sitting on
+# PROXY_TIMEOUT for half an hour.
+PROXY_CONNECT_TIMEOUT = int(os.getenv("GPUSTACK_PROXY_CONNECT_TIMEOUT_SECONDS", 5))
+# Socket read timeout: max gap between bytes during the response stream.
+# Default 60s — normal streaming chat emits at least one token per second, so a
+# 60s silence reliably means upstream died mid-stream. Long enough not to kill
+# legitimate slow first-token responses on big models.
+PROXY_SOCK_READ_TIMEOUT = int(os.getenv("GPUSTACK_PROXY_SOCK_READ_TIMEOUT_SECONDS", 60))
 PROXY_UPSTREAM_IDLE_TIMEOUT = int(
     os.getenv("GPUSTACK_PROXY_UPSTREAM_IDLE_TIMEOUT_SECONDS", 3)
 )
+
+# Auto-load cold-start gate (per-model in-flight waiter cap).
+# When a model is at replicas=0 and a request arrives, openai.py long-polls up
+# to AUTO_LOAD_TIMEOUT (5 min) waiting for it to come up. Without this cap, a
+# burst of requests against a cold model puts hundreds of handlers in that
+# long-poll. Default 300 waiters per model — chosen to comfortably absorb
+# normal-scale concurrent demand against a single model that's coming up,
+# while still capping a truly pathological burst (1k+). Excess requests return
+# 503 Retry-After. Set to 0 to disable the gate entirely.
+COLD_START_MAX_WAITERS = int(os.getenv("GPUSTACK_COLD_START_MAX_WAITERS", 300))
 
 # HTTP client TCP connector configuration
 TCP_CONNECTOR_LIMIT = int(os.getenv("GPUSTACK_TCP_CONNECTOR_LIMIT", 1000))
