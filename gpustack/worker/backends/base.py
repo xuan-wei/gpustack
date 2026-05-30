@@ -874,20 +874,50 @@ exec "$@"
             self._model.backend_parameters = ["--ctx-size 1024"] -> ["--ctx-size", "1024"]
             self._model.backend_parameters = [" --ctx-size=1024"] -> ["--ctx-size=1024"]
             self._model.backend_parameters = ["--ctx-size =1024"] -> ["--ctx-size=1024"]
+
+        For backends whose CLI parser does not understand `--flag=value` form
+        (notably llama.cpp's llama-server, which iterates argv looking for exact
+        flag-name matches and treats the next argv as the value), the `=` form
+        is normalized into two separate tokens.
         """
+        # llama-server (community llama.cpp backend) rejects `--flag=value`;
+        # split it into two tokens so users can write either form in the UI.
+        expand_eq = self._model.backend == "llama.cpp"
+
         result = []
         for param in self._model.backend_parameters or []:
-            # Strip leading/trailing whitespace
             param_stripped = param.strip()
-
-            if "=" in param_stripped:
-                # Handle cases like "--foo = bar" or "--foo  =bar"
-                # Split by = and strip whitespace around it
-                key, value = map(str.strip, param_stripped.split("=", 1))
-                result.append(f"{key}={value}")
+            if not param_stripped:
                 continue
 
-            result.extend(shlex.split(param_stripped))
+            if not expand_eq or not param_stripped.startswith("--"):
+                # Non-flag values (e.g. "nomic-bert.context_length=int:8192")
+                # or non-llama.cpp backends: keep as-is.
+                if "=" in param_stripped:
+                    key, value = map(str.strip, param_stripped.split("=", 1))
+                    result.append(f"{key}={value}")
+                else:
+                    result.extend(shlex.split(param_stripped))
+                continue
+
+            # expand_eq + starts with "--": split by first = or space
+            eq_pos = param_stripped.find("=")
+            sp_pos = param_stripped.find(" ")
+            if eq_pos < 0 and sp_pos < 0:
+                result.append(param_stripped)
+            else:
+                # Pick whichever delimiter comes first
+                if eq_pos < 0:
+                    split_pos = sp_pos
+                elif sp_pos < 0:
+                    split_pos = eq_pos
+                else:
+                    split_pos = min(eq_pos, sp_pos)
+                key = param_stripped[:split_pos].strip()
+                value = param_stripped[split_pos + 1 :].strip()
+                result.append(key)
+                if value:
+                    result.append(value)
         return result
 
     def _transform_workload_plan(

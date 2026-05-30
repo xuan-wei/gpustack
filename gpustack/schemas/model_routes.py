@@ -28,7 +28,12 @@ if TYPE_CHECKING:
     from gpustack.schemas.model_provider import ModelProvider
 
 
-name_pattern = r'^[A-Za-z](?:[A-Za-z0-9_\-\.]*[A-Za-z0-9])?$'
+name_pattern = r'^[A-Za-z](?:[A-Za-z0-9_\-\.\:]*[A-Za-z0-9])?$'
+
+
+def normalize_name(v: str) -> str:
+    """Passthrough — colons are now allowed in route/model-route names."""
+    return v
 
 
 class AccessPolicyEnum(str, Enum):
@@ -137,6 +142,7 @@ class ModelRouteTargetBase(ModelRouteTargetCreate):
     def validate_route_name(cls, v):
         if not isinstance(v, str):
             raise ValueError("route_name must be a string")
+        v = normalize_name(v)
         if not re.match(name_pattern, v):
             raise ValueError(
                 "route_name must start with a letter, only contain letters, numbers, hyphens, underscores, and not end with hyphen or underscore"
@@ -215,6 +221,7 @@ class ModelRouteUpdateBase(SQLModel):
     def validate_name(cls, v):
         if not isinstance(v, str):
             raise ValueError("name must be a string")
+        v = normalize_name(v)
         if not re.match(name_pattern, v):
             raise ValueError(
                 "name must start with a letter, only contain letters, numbers, hyphens, underscores, and not end with hyphen or underscore"

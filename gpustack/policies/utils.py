@@ -12,6 +12,7 @@ from gpustack.policies.base import (
 from gpustack.scheduler.calculator import calculate_local_model_weight_size
 from gpustack.schemas.models import (
     ModelInstance,
+    ModelInstanceStateEnum,
     Model,
     CategoryEnum,
     SourceEnum,
@@ -54,8 +55,10 @@ def get_worker_allocatable_resource(  # noqa: C901
     is_unified_memory = worker.status.memory.is_unified_memory
     model_instances = get_worker_model_instances(all_model_instances, worker)
     allocated = Allocated(ram=0, vram={})
+    pending_vram = {}
 
     for model_instance in model_instances:
+        is_running = model_instance.state == ModelInstanceStateEnum.RUNNING
         # Handle resource allocation for main worker
         if model_instance.worker_id == worker.id and (
             gpu_type is None
@@ -65,6 +68,9 @@ def get_worker_allocatable_resource(  # noqa: C901
             allocated.ram += model_instance.computed_resource_claim.ram or 0
             if model_instance.gpu_indexes:
                 update_allocated_vram(allocated, model_instance.computed_resource_claim)
+                if not is_running:
+                    for gi, v in model_instance.computed_resource_claim.vram.items():
+                        pending_vram[gi] = pending_vram.get(gi, 0) + v
 
         # Handle resource allocation for subordinate workers
         if (
@@ -97,11 +103,10 @@ def get_worker_allocatable_resource(  # noqa: C901
             ):
                 continue
             allocatable_vram = max(
-                (
-                    gpu.memory.total
-                    - allocated.vram.get(gpu_index, 0)
-                    - worker.system_reserved.vram
-                ),
+                gpu.memory.total
+                - (gpu.memory.used if gpu.memory.used is not None else gpu.memory.total)
+                - pending_vram.get(gpu_index, 0)
+                - worker.system_reserved.vram,
                 0,
             )
             allocatable.vram[gpu_index] = allocatable_vram

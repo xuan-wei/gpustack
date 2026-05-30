@@ -88,6 +88,7 @@ function make_community_backends() {
       uv pip install PyYAML && uv run make
     else
       # For local development, use virtual environment
+      # shellcheck disable=SC1091
       uv venv && source .venv/bin/activate && uv pip install PyYAML && uv run make
     fi
   )

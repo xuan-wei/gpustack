@@ -249,8 +249,9 @@ async def sync_replicas(session: AsyncSession, model: Model):
         return
 
     instances = await ModelInstance.all_by_field(session, "model_id", model.id)
-    if len(instances) < model.replicas:
-        for _ in range(model.replicas - len(instances)):
+    active = [i for i in instances if not i.is_draining]
+    if len(active) < model.replicas:
+        for _ in range(model.replicas - len(active)):
             name_prefix = ''.join(
                 random.choices(string.ascii_letters + string.digits, k=5)
             )
@@ -274,24 +275,26 @@ async def sync_replicas(session: AsyncSession, model: Model):
             await ModelInstanceService(session).create(instance)
             logger.debug(f"Created model instance for model {model.name}")
 
-    elif len(instances) > model.replicas:
+    elif len(active) > model.replicas:
         # Get instances for update lock, to avoid race condition with scheduler
         instances = await ModelInstance.all_by_field(
             session, "model_id", model.id, for_update=True
         )
-        candidates = await find_scale_down_candidates(instances, model)
+        active = [i for i in instances if not i.is_draining]
+        candidates = await find_scale_down_candidates(active, model)
 
-        scale_down_count = len(candidates) - model.replicas
+        scale_down_count = len(active) - model.replicas
         if scale_down_count > 0:
-            scale_down_instances = []
+            # Mark candidates as draining instead of deleting immediately.
+            # AutoDrainTask will perform the actual deletion after the routing
+            # layer (Higress) has converged on the new endpoint set.
             for candidate in candidates[:scale_down_count]:
-                scale_down_instances.append(candidate.model_instance)
-
-            scale_down_instance_names = await ModelInstanceService(
-                session
-            ).batch_delete(scale_down_instances)
-            if scale_down_instance_names:
-                logger.debug(f"Deleted model instances: {scale_down_instance_names}")
+                mi = candidate.model_instance
+                mi.is_draining = True
+                await mi.update(session)
+                logger.info(
+                    f"Marked instance {mi.name} as draining for model {model.name}"
+                )
 
 
 async def distribute_models_to_user(
@@ -550,7 +553,10 @@ async def sync_ready_replicas(session: AsyncSession, model: Model):
 
     ready_replicas: int = 0
     for _, instance in enumerate(instances):
-        if instance.state == ModelInstanceStateEnum.RUNNING:
+        if (
+            instance.state == ModelInstanceStateEnum.RUNNING
+            and not instance.is_draining
+        ):
             ready_replicas += 1
 
     if model.ready_replicas != ready_replicas:
@@ -894,6 +900,7 @@ async def calculate_model_destinations(
         and instance.port is not None
         and instance.worker_ip != ""
         and instance.state == ModelInstanceStateEnum.RUNNING
+        and not instance.is_draining
     ]
     worker_list = await Worker.all_by_fields(
         session=session,

@@ -548,10 +548,24 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
             if candidate_func == self.find_single_worker_cpu_candidates:
                 return True
 
+            gpus_per_replica = (
+                self._model.gpu_selector.gpus_per_replica
+                if self._model.gpu_selector
+                else None
+            )
+            if (
+                gpus_per_replica is not None
+                and gpus_per_replica > 1
+                and candidate_func
+                == self.find_single_worker_single_gpu_full_offloading_candidates
+            ):
+                return True
+
             worker_num = len(self._selected_gpu_ids_by_worker)
             if (
                 worker_num > 1
                 and candidate_func != self.find_multi_worker_multi_gpu_candidates
+                and self._model.distributed_inference_across_workers
             ):
                 return True
 
@@ -562,16 +576,21 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
                 selected_gpu_count = len(
                     self._selected_gpu_ids_by_worker.get(selected_worker_name)
                 )
+                effective_gpu_count = (
+                    gpus_per_replica
+                    if gpus_per_replica is not None
+                    else selected_gpu_count
+                )
 
                 if (
                     candidate_func == self.find_multi_worker_multi_gpu_candidates
                     or (
-                        selected_gpu_count > 1
+                        effective_gpu_count > 1
                         and candidate_func
                         == self.find_single_worker_single_gpu_full_offloading_candidates
                     )
                     or (
-                        selected_gpu_count == 1
+                        effective_gpu_count == 1
                         and candidate_func
                         == self.find_single_worker_multi_gpu_full_offloading_candidates
                     )
@@ -626,19 +645,25 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
             return True
 
         if self._selected_gpu_ids_by_worker:
+            # Pre-check: if ALL selected GPUs lack enough VRAM, fail-fast. If at
+            # least one selected GPU has enough headroom for a single layer, let
+            # the candidate finders pick from the satisfactory subset. This
+            # matters when the user picks many GPUs intending replica placement
+            # to spread across them, e.g. replicas=2, gpus_per_replica=1, picking
+            # 8 GPUs: even if one selected GPU is already taken by the running
+            # replica, the rest should still satisfy the pending replica.
+            any_satisfactory = False
+            insufficient_gpus = []  # (selected_gpu_id, vram, vram_claim)
+            invalid_worker = None
+
             for (
                 worker_name,
                 selected_gpu_ids,
             ) in self._selected_gpu_ids_by_worker.items():
                 worker = self._worker_name_to_worker.get(worker_name)
                 if not worker:
-                    self._event_collector.add(
-                        EventLevelEnum.ERROR,
-                        EVENT_ACTION_PRE_CHECK,
-                        f"Selected GPUs's worker {worker_name} not found in the workers list.",
-                        reason=EVENT_REASON_SELECTED_INVALID_GPU,
-                    )
-                    return True
+                    invalid_worker = worker_name
+                    break
 
                 is_unified_memory = worker.status.memory.is_unified_memory
 
@@ -654,14 +679,31 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
                     selected_gpu_index = safe_int(matched.get("gpu_index"))
                     vram = worker_allocatable.vram.get(selected_gpu_index, 0)
                     vram_claim = self._get_single_layer_vram(is_unified_memory, False)
-                    if vram < vram_claim:
-                        self._event_collector.add(
-                            EventLevelEnum.ERROR,
-                            EVENT_ACTION_PRE_CHECK,
-                            f"Selected GPU {selected_gpu_id} lacks enough VRAM. At least {byte_to_gib(vram_claim)} GiB is required.",
-                            reason=EVENT_REASON_INSUFFICIENT_RESOURCES,
-                        )
-                        return True
+                    if vram >= vram_claim:
+                        any_satisfactory = True
+                    else:
+                        insufficient_gpus.append((selected_gpu_id, vram, vram_claim))
+
+            if invalid_worker is not None:
+                self._event_collector.add(
+                    EventLevelEnum.ERROR,
+                    EVENT_ACTION_PRE_CHECK,
+                    f"Selected GPUs's worker {invalid_worker} not found in the workers list.",
+                    reason=EVENT_REASON_SELECTED_INVALID_GPU,
+                )
+                return True
+
+            if not any_satisfactory and insufficient_gpus:
+                # All selected GPUs lack enough VRAM. Report the first one to
+                # preserve the legacy single-GPU error message.
+                first_gpu_id, _, vram_claim = insufficient_gpus[0]
+                self._event_collector.add(
+                    EventLevelEnum.ERROR,
+                    EVENT_ACTION_PRE_CHECK,
+                    f"Selected GPU {first_gpu_id} lacks enough VRAM. At least {byte_to_gib(vram_claim)} GiB is required.",
+                    reason=EVENT_REASON_INSUFFICIENT_RESOURCES,
+                )
+                return True
 
     async def find_single_worker_single_gpu_full_offloading_candidates(
         self, workers: List[Worker]

@@ -33,6 +33,7 @@ from gpustack.policies.utils import (
     sort_gpu_indexes_by_allocatable_rate,
     sort_selected_workers_by_gpu_type_and_resource,
 )
+from gpustack.utils.gpu_memory_range import effective_gpu_memory_utilization
 from gpustack.utils.unit import byte_to_gib
 
 logger = logging.getLogger(__name__)
@@ -474,10 +475,16 @@ class ScheduleCandidatesSelector(ABC):
                         if total_vram is None or allocatable_vram is None:
                             continue
 
+                        eff_gmu = effective_gpu_memory_utilization(
+                            gpu_memory_utilization,
+                            total_vram,
+                            getattr(self._model, "gpu_memory_min_gib", None),
+                            getattr(self._model, "gpu_memory_max_gib", None),
+                        )
                         allocatable_gpu_memory_utilization = (
                             allocatable_vram / total_vram
                         )
-                        if allocatable_gpu_memory_utilization >= gpu_memory_utilization:
+                        if allocatable_gpu_memory_utilization >= eff_gmu:
                             satisfied_gpus_count += 1
                             satisfied_gpus_by_worker.setdefault(
                                 gpu_type, {}
@@ -780,18 +787,6 @@ class ScheduleCandidatesSelector(ABC):
             return non_overcommits_candidates
 
         # Handle overcommit candidates
-        if self._model.replicas > 1:
-            event_collector.add(
-                EventLevelEnum.INFO,
-                EVENT_ACTION_MANUAL_MULTI,
-                str(
-                    ListMessageBuilder(
-                        f"Found {len(candidates) - len(non_overcommits_candidates)} candidate, manual scheduling for multi-replica model instances does not allow overcommit or heterogeneous deployment topologies.",
-                    )
-                ),
-            )
-            return []
-
         if best_overcommit_candidate:
             event_collector.add(
                 EventLevelEnum.INFO, EVENT_ACTION_MANUAL_MULTI, overcommit_msg
@@ -826,10 +821,13 @@ class ScheduleCandidatesSelector(ABC):
 
             # LLMs
             if gpu_memory_utilization > 0:
-                if (
-                    total_vram > 0
-                    and allocatable_vram / total_vram >= gpu_memory_utilization
-                ):
+                eff_gmu = effective_gpu_memory_utilization(
+                    gpu_memory_utilization,
+                    total_vram,
+                    getattr(self._model, "gpu_memory_min_gib", None),
+                    getattr(self._model, "gpu_memory_max_gib", None),
+                )
+                if total_vram > 0 and allocatable_vram / total_vram >= eff_gmu:
                     satisfied_gpu_indexes.append(gpu_index)
                 else:
                     unsatisfied_gpu_indexes.append(gpu_index)
@@ -840,11 +838,27 @@ class ScheduleCandidatesSelector(ABC):
             if len(satisfied_gpu_indexes) >= self._gpu_count:
                 break
 
-        # Extend with unsatisfied gpu indexes if not enough satisfied gpus
+        # Extend with unsatisfied gpu indexes if not enough satisfied gpus.
+        # When the user set explicit VRAM bounds (min/max_gib), respect them
+        # strictly — don't fall back to overcommit, because the user is
+        # explicitly saying "I need this much VRAM per GPU."
+        # Without explicit bounds, keep legacy overcommit fallback.
+        min_gib = getattr(self._model, "gpu_memory_min_gib", None)
+        max_gib = getattr(self._model, "gpu_memory_max_gib", None)
+        has_explicit_range = (min_gib and min_gib > 0) or (max_gib and max_gib > 0)
+
+        if has_explicit_range:
+            usable_unsatisfied = []
+        else:
+            usable_unsatisfied = unsatisfied_gpu_indexes[:]
+
         used_gpu_indexes = satisfied_gpu_indexes.copy()
         used_gpu_indexes.extend(
-            unsatisfied_gpu_indexes[: self._gpu_count - len(satisfied_gpu_indexes)]
+            usable_unsatisfied[: self._gpu_count - len(satisfied_gpu_indexes)]
         )
+
+        if len(used_gpu_indexes) < self._gpu_count:
+            return []
 
         # Get vram claims for used gpus
         vram_claims = self._get_worker_resource_claim(

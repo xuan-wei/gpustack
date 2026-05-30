@@ -41,6 +41,11 @@ from gpustack.server.services import (
     UserService,
 )
 from gpustack.utils.network import use_proxy_env_for_url
+from gpustack.utils.auto_load import (
+    READY,
+    try_auto_load,
+)
+from gpustack.utils.cold_start_gate import ColdStartCapacityExceeded
 
 
 logger = logging.getLogger(__name__)
@@ -97,7 +102,7 @@ async def list_models(
 @router.post("/images/edits")
 @router.post("/audio/speech")
 @router.post("/audio/transcriptions")
-async def proxy_request_by_model(
+async def proxy_request_by_model(  # noqa: C901
     request: Request,
     user: CurrentUserDep,
     session: SessionDep,
@@ -121,6 +126,17 @@ async def proxy_request_by_model(
         session
     ).get_model_ids_by_model_route_name(model_name)
     if len(models) == 0:
+        try:
+            result = await try_auto_load(session, model_name)
+        except ColdStartCapacityExceeded as exc:
+            raise ServiceUnavailableException(
+                message=f"Model is cold-starting and reached waiter cap ({exc.cap})",
+                is_openai_exception=True,
+            )
+        if result.outcome == READY and result.model:
+            models = [result.model]
+            session.expire_all()
+    if len(models) == 0:
         raise NotFoundException(
             message="Model not found or no running instances available",
             is_openai_exception=True,
@@ -130,6 +146,16 @@ async def proxy_request_by_model(
     request.state.model = model
 
     mutate_request(request, model_name, body_json, form_data)
+
+    if model.replicas == 0 and model.auto_load:
+        try:
+            await try_auto_load(session, model.name)
+        except ColdStartCapacityExceeded as exc:
+            raise ServiceUnavailableException(
+                message=f"Model is cold-starting and reached waiter cap ({exc.cap})",
+                is_openai_exception=True,
+            )
+        await session.refresh(model)
 
     instance = await get_running_instance(session, model.id)
     worker = await WorkerService(session).get_by_id(instance.worker_id)
@@ -157,11 +183,19 @@ async def proxy_request_by_model(
     try:
         if stream:
             return await handle_streaming_request(
-                request, url, body_json, form_data, extra_headers
+                request,
+                url,
+                body_json,
+                form_data,
+                extra_headers,
             )
         else:
             return await handle_standard_request(
-                request, url, body_json, form_data, extra_headers
+                request,
+                url,
+                body_json,
+                form_data,
+                extra_headers,
             )
     except asyncio.TimeoutError as e:
         error_message = f"Request to {url} timed out"
@@ -276,7 +310,10 @@ async def handle_streaming_request(
     form_data: Optional[aiohttp.FormData],
     extra_headers: Optional[dict] = None,
 ):
-    timeout = aiohttp.ClientTimeout(total=envs.PROXY_TIMEOUT)
+    timeout = aiohttp.ClientTimeout(
+        total=envs.PROXY_TIMEOUT,
+        connect=envs.PROXY_CONNECT_TIMEOUT,
+    )
     headers = filter_headers(request.headers)
     if extra_headers:
         headers.update(extra_headers)
@@ -349,7 +386,10 @@ async def handle_standard_request(
         if use_proxy_env
         else request.app.state.http_client_no_proxy
     )
-    timeout = aiohttp.ClientTimeout(total=envs.PROXY_TIMEOUT)
+    timeout = aiohttp.ClientTimeout(
+        total=envs.PROXY_TIMEOUT,
+        connect=envs.PROXY_CONNECT_TIMEOUT,
+    )
     async with http_client.request(
         method=request.method,
         url=url,
@@ -375,6 +415,7 @@ def filter_headers(headers):
         and key.lower() != "content-type"
         and key.lower() != "transfer-encoding"
         and key.lower() != "authorization"
+        and key.lower() != "x-gpustack-model"
     }
 
 

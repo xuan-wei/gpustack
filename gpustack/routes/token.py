@@ -11,8 +11,17 @@ from gpustack.api.exceptions import (
 from gpustack.server.services import ModelRouteService, UserService
 from gpustack.schemas.api_keys import ApiKey
 from gpustack.schemas.users import User
-from gpustack.schemas.models import AccessPolicyEnum
+from gpustack.schemas.models import (
+    AccessPolicyEnum,
+)
 from gpustack.server.deps import SessionDep
+from gpustack.utils.auto_load import (
+    FAILED,
+    READY,
+    SKIPPED,
+    try_auto_load,
+)
+from gpustack.utils.cold_start_gate import ColdStartCapacityExceeded
 from gpustack.api.auth import (
     api_key_header_auth,
     basic_auth,
@@ -35,6 +44,41 @@ model_not_found_exception = NotFoundException(
     message="Model not found",
     is_openai_exception=True,
 )
+
+AUTO_LOAD_FAIL_RETRY_AFTER = "30"
+AUTO_LOAD_LOADING_RETRY_AFTER = "10"
+
+
+def _loading_failed_response(msg: str) -> Response:
+    return Response(
+        status_code=503,
+        headers={"Retry-After": AUTO_LOAD_FAIL_RETRY_AFTER},
+        media_type="application/json",
+        content=f'{{"error":{{"message":"{msg}","type":"model_loading_failed"}}}}',
+    )
+
+
+async def _try_auto_load(session, model_name: str) -> Optional[Response]:
+    try:
+        result = await try_auto_load(session, model_name)
+    except ColdStartCapacityExceeded as exc:
+        logger.warning(str(exc))
+        return _loading_failed_response(
+            f"Model is cold-starting and reached its waiter cap ({exc.cap}), "
+            f"please retry"
+        )
+
+    if result.outcome in (SKIPPED, READY):
+        return None
+    if result.outcome == FAILED:
+        return _loading_failed_response(result.message or "Model failed to load")
+
+    return Response(
+        status_code=503,
+        headers={"Retry-After": AUTO_LOAD_LOADING_RETRY_AFTER},
+        media_type="application/json",
+        content='{"error":{"message":"Model is still loading, please retry","type":"model_loading"}}',
+    )
 
 
 @router.get("")
@@ -97,6 +141,11 @@ async def server_auth(
             raise ForbiddenException(
                 message=f"Api key not allowed to access model {model_name}"
             )
+
+    auto_load_response = await _try_auto_load(session, model_name)
+    if auto_load_response is not None:
+        return auto_load_response
+
     headers = {
         "X-Mse-Consumer": consumer,
         "Authorization": f"Bearer {registration_token}",

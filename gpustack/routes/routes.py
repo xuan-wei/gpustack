@@ -20,6 +20,7 @@ from gpustack.routes import (
     users,
     models,
     openai,
+    runtime_snapshots,
     workers,
     cloud_credentials,
     worker_pools,
@@ -93,6 +94,13 @@ cluster_client_router.add_api_route(
 )
 
 model_routers = [
+    # Registered before models.router so /models/runtime-snapshots is matched
+    # before models.router's /models/{id} catch-all (fork-specific endpoint).
+    {
+        "router": runtime_snapshots.router,
+        "prefix": "/models",
+        "tags": ["Models"],
+    },
     {"router": models.router, "prefix": "/models", "tags": ["Models"]},
     {
         "router": model_instances.router,

@@ -237,12 +237,58 @@ async def validate_and_mutate_benchmark_in(
         )  # treat non-positive request_rate as unlimited
 
     snapshot = await get_benchmark_snapshot(session, instance, model)
+
+    # For GGUF/llama.cpp models, the .gguf file is not a valid HF tokenizer
+    # source — guidellm and the ShareGPT adapter both fail with a UTF-8 decode
+    # error if pointed at it. Heuristically derive a sibling HF/MS repo whose
+    # tokenizer matches the GGUF-embedded one (Qwen-style `{name}-GGUF`
+    # naming). Reject creation early if we cannot derive one.
+    if instance.backend == "llama.cpp":
+        tokenizer_source = _derive_tokenizer_source(model)
+        if not tokenizer_source:
+            raise BadRequestException(
+                message=(
+                    f"Benchmarking GGUF model '{model.name}' requires a HF-format "
+                    "tokenizer source (config.json + tokenizer.json). Could not "
+                    "auto-derive one from the model's source identifier. Configure "
+                    "the model with a `-GGUF` suffixed huggingface_repo_id or "
+                    "model_scope_model_id so the sibling repo can be located."
+                )
+            )
+        instance_snap = snapshot.instances.get(instance.name)
+        if instance_snap is not None:
+            instance_snap.tokenizer_source = tokenizer_source
+
     mutated.snapshot = snapshot
     mutated.gpu_summary, mutated.gpu_vendor_summary = summary_gpu_snapshots(
         snapshot.gpus
     )
     mutated.worker_id = instance.worker_id
     return mutated
+
+
+_GGUF_SUFFIXES = ("-gguf", "-GGUF")
+
+
+def _derive_tokenizer_source(model: Model) -> Optional[str]:
+    """Derive a HF-format tokenizer source from a GGUF model's source ID.
+
+    Strips a trailing `-GGUF` suffix from huggingface_repo_id or
+    model_scope_model_id, on the assumption that the sibling non-GGUF repo
+    holds an HF tokenizer compatible with the one embedded in the .gguf file.
+    Returns None when no candidate matches the naming convention.
+    """
+    candidates = [
+        getattr(model, "huggingface_repo_id", None),
+        getattr(model, "model_scope_model_id", None),
+    ]
+    for cand in candidates:
+        if not cand:
+            continue
+        for suffix in _GGUF_SUFFIXES:
+            if cand.endswith(suffix):
+                return cand[: -len(suffix)]
+    return None
 
 
 @router.post("", response_model=BenchmarkPublic)

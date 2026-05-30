@@ -360,6 +360,7 @@ async def validate_gpu_ids(  # noqa: C901
         is_custom_backend(model_backend)
         and len(worker_name_set) > 1
         and model_in.replicas == 1
+        and model_in.distributed_inference_across_workers
     ):
         raise BadRequestException(
             message="Distributed inference across multiple workers is not supported for custom backends."
@@ -477,10 +478,25 @@ async def update_model(session: SessionDep, id: int, model_in: ModelUpdate):
         patch["image_name"] = None
         model_in = patch
 
+    # Detect manual replica change BEFORE the update overwrites model fields.
+    incoming_replicas = (
+        model_in.get("replicas") if isinstance(model_in, dict) else model_in.replicas
+    )
+    replicas_changed = (
+        incoming_replicas is not None and incoming_replicas != model.replicas
+    )
+
     try:
         await ModelService(session).update(model, model_in)
     except Exception as e:
         raise InternalServerErrorException(message=f"Failed to update model: {e}")
+
+    # Stamp AFTER update so active_record.update(source) can't overwrite it.
+    if replicas_changed:
+        from datetime import datetime, timezone
+
+        model.last_scale_time = datetime.now(timezone.utc)
+        await model.update(session)
 
     return model
 

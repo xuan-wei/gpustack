@@ -538,15 +538,6 @@ async def evaluate_gguf_model(
         model.distributable = True
 
     if model.gpu_selector and model.gpu_selector.gpu_ids:
-        worker_gpu_ids = group_gpu_ids_by_worker(model.gpu_selector.gpu_ids)
-        if (
-            len(worker_gpu_ids) > 1
-            and model.distributable
-            and not model.distributed_inference_across_workers
-        ):
-            should_update = True
-            model.distributed_inference_across_workers = True
-
         gpus_per_replica_modified = set_model_gpus_per_replica(model)
         should_update = should_update or gpus_per_replica_modified
 

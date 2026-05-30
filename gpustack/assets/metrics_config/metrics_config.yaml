@@ -39,6 +39,14 @@ gpustack_metrics:
     type: Counter
     description: "Total number of generated tokens."
 
+  gpustack:prompt_seconds:
+    type: Counter
+    description: "Cumulative seconds spent on prefill (prompt processing)."
+
+  gpustack:generation_seconds:
+    type: Counter
+    description: "Cumulative seconds spent on decode (token generation)."
+
   gpustack:request_prompt_tokens:
     type: Histogram
     description: "Number of prefill tokens processed."
@@ -112,6 +120,16 @@ runtime_mapping:
     "<=0.4.4":
       sglang:time_per_output_token_seconds: gpustack:time_per_output_token_seconds
       
+  llama.cpp:
+    "*": # b6000+
+      llamacpp:requests_processing: gpustack:num_requests_running
+      llamacpp:requests_deferred: gpustack:num_requests_waiting
+      llamacpp:kv_cache_usage_ratio: gpustack:kv_cache_usage_ratio
+      llamacpp:prompt_tokens: gpustack:prompt_tokens
+      llamacpp:tokens_predicted: gpustack:generation_tokens
+      llamacpp:prompt_seconds: gpustack:prompt_seconds
+      llamacpp:tokens_predicted_seconds: gpustack:generation_seconds
+
   MindIE:
     "*": # 2.3.0
       num_requests_running: gpustack:num_requests_running

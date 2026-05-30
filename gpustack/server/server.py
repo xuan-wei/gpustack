@@ -56,6 +56,11 @@ from gpustack.server.worker_status_buffer import flush_worker_status_to_db
 from gpustack.server.worker_instance_cleaner import WorkerInstanceCleaner
 from gpustack.server.worker_syncer import WorkerSyncer
 from gpustack.server.metrics_collector import GatewayMetricsCollector
+from gpustack.server.auto_metrics import AutoMetricsTask
+from gpustack.server.auto_unload import AutoUnloadTask
+from gpustack.server.auto_scaling import AutoScalingTask
+from gpustack.server.auto_drain import AutoDrainTask
+from gpustack.server.runtime_metrics_aggregator import RuntimeMetricsAggregator
 from gpustack.utils.process import add_signal_handlers_in_loop
 from gpustack.config.registration import write_registration_token
 from gpustack.exporter.exporter import MetricExporter
@@ -120,8 +125,15 @@ class Server:
         self._start_model_usage_flusher()
         self._start_worker_status_flusher()
         self._start_worker_instance_cleaner()
-        self._start_metrics_exporter()
+        self._gateway_collector = None
+        self._runtime_metrics_aggregator = None
         self._start_gateway_metrics_collector()
+        self._start_auto_metrics_task()
+        self._start_auto_unload_task()
+        self._start_runtime_metrics_aggregator()
+        self._start_auto_scaling_task()
+        self._start_auto_drain_task()
+        self._start_metrics_exporter()
         self._start_query_count_logger()
         self._start_default_registry_checker()
 
@@ -130,6 +142,7 @@ class Server:
         app = create_app(self._config)
         app.state.server_config = self._config
         app.state.jwt_manager = jwt_manager
+        app.state.runtime_metrics_aggregator = self._runtime_metrics_aggregator
         if self._config.enable_cors:
             app.add_middleware(
                 CORSMiddleware,
@@ -284,17 +297,50 @@ class Server:
 
         logger.debug("Worker instance cleaner started.")
 
+    def _start_auto_metrics_task(self):
+        auto_metrics_task = AutoMetricsTask(
+            interval=30, collector=self._gateway_collector
+        )
+        self._create_async_task(auto_metrics_task.start())
+
+        logger.debug("Auto metrics task started.")
+
+    def _start_auto_unload_task(self):
+        auto_unload_task = AutoUnloadTask(interval=30)
+        self._create_async_task(auto_unload_task.start())
+
+        logger.debug("Auto unload task started.")
+
+    def _start_auto_scaling_task(self):
+        auto_scaling_task = AutoScalingTask(
+            interval=60, aggregator=self._runtime_metrics_aggregator
+        )
+        self._create_async_task(auto_scaling_task.start())
+
+        logger.debug("Auto scaling task started.")
+
+    def _start_runtime_metrics_aggregator(self):
+        self._runtime_metrics_aggregator = RuntimeMetricsAggregator(interval=30)
+        self._create_async_task(self._runtime_metrics_aggregator.start())
+        logger.debug("Runtime metrics aggregator started.")
+
+    def _start_auto_drain_task(self):
+        auto_drain_task = AutoDrainTask(interval=10, drain_wait_seconds=5)
+        self._create_async_task(auto_drain_task.start())
+
+        logger.debug("Auto drain task started.")
+
     def _start_gateway_metrics_collector(self):
         if self._config.gateway_mode not in [
             GatewayModeEnum.embedded,
             GatewayModeEnum.external,
         ]:
             return
-        collector = GatewayMetricsCollector(cfg=self._config)
+        self._gateway_collector = GatewayMetricsCollector(cfg=self._config)
 
         async def _start_collector_after_port_ready():
             await self._wait_for_gateway_ready()
-            await collector.start()
+            await self._gateway_collector.start()
             logger.debug("Gateway metrics collector started.")
 
         self._create_async_task(_start_collector_after_port_ready())
